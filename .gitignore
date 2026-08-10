@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+STATE.json
+approved-remotes.txt
+approvals/
+ledger/
+gate-guard.config.json

@@ -1,0 +1,29 @@
+{
+  "state_path": "STATE.json",
+  "trust_tier_field": "trust_tier",
+  "min_tier_for_tier_gated": 1,
+  "approved_remotes_file": "approved-remotes.txt",
+  "blocked_log": "approvals/blocked.jsonl",
+  "queue_path": "approvals/queue.jsonl",
+  "decisions_path": "approvals/decisions.jsonl",
+  "ledger_path": "ledger/ledger.jsonl",
+  "immutable_fields": ["trust_tier"],
+  "trust_threshold_usd": 2000,
+  "approval_tiers": [
+    "SPEND",
+    "ACCOUNT_CREATION",
+    "LEGAL_ENTITY",
+    "CONTRACT_DEPLOY",
+    "FUND_MOVEMENT",
+    "PUBLIC_CLAIM",
+    "TOOLING",
+    "OTHER"
+  ],
+  "protected_paths": [
+    "STATE.json",
+    "AGENT.md",
+    "gate_guard.py",
+    "approved-remotes.txt",
+    ".claude/settings.json"
+  ]
+}

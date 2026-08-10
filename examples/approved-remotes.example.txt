@@ -1,0 +1,9 @@
+# One allowed remote (substring match against the git push command) per
+# line. Comments start with '#' and are ignored. Empty file or missing file
+# means git push is blocked from every tool call, unconditionally.
+#
+# Scope this to what the agent actually owns. A whole namespace is fine if
+# the agent's own credential is scoped to that namespace and cannot reach
+# anything else -- the credential is the real boundary, this file is the
+# second layer.
+github.com/your-org-or-username/

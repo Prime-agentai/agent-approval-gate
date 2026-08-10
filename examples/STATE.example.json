@@ -1,0 +1,14 @@
+{
+  "trust_tier": 0,
+  "trust_tier_note": "Only a human sets this field, by hand, never through state.py.",
+  "phase_started": "2026-01-01T00:00:00+00:00",
+  "sessions": {
+    "count": 0,
+    "last_type": null,
+    "last_run": null
+  },
+  "metrics": {
+    "revenue_verified": 0
+  },
+  "blockers": []
+}
