@@ -39,6 +39,8 @@ agent silently retrying or working around it.
 
 | File | Purpose |
 |---|---|
+| `install.py` | One-command setup: copies the scripts, writes a config, merges the hook into your `.claude/settings.json` without clobbering existing hooks. Idempotent; `--dry-run` supported. |
+| `verify.py` | Fires real probe payloads through the hook *as your harness has it registered* and reports what actually blocked. The answer to "is this thing even running?" |
 | `gate_guard.py` | The `PreToolUse` hook. Reads the pending tool call on stdin, exits 0 (allow) or 2 (block). |
 | `approve.py` | The approval queue CLI: file a request, list what's pending, record a human's decision. |
 | `state.py` | The only sanctioned way to write an agent's state file — the chokepoint that keeps a human-owned field (like a trust tier) actually human-owned. |
@@ -47,6 +49,7 @@ agent silently retrying or working around it.
 | `examples/approved-remotes.example.txt` | Format for the git-push allowlist. |
 | `examples/STATE.example.json` | Minimal shape `state.py` expects. |
 | `tests/test_gate_guard.py` | A small sanity suite for the default rule pack (13 cases). Not a security audit — see "Testing" below. |
+| `tests/test_install.py` | 21 cases pinning down the settings merge: existing hooks survive, re-running doesn't duplicate, malformed settings are refused rather than overwritten. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -55,23 +58,104 @@ Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
 
 ```bash
 git clone https://github.com/Prime-agentai/agent-approval-gate.git
-cd your-agent-project
-cp /path/to/agent-approval-gate/gate_guard.py bin/
-cp /path/to/agent-approval-gate/approve.py bin/
-cp /path/to/agent-approval-gate/state.py bin/
-cp /path/to/agent-approval-gate/gate-guard.config.example.json gate-guard.config.json
+cd agent-approval-gate
+python3 install.py --target /path/to/your-agent-project
+python3 verify.py  --target /path/to/your-agent-project
 ```
 
-Edit `gate-guard.config.json`: set `state_path` to wherever your agent's
-state file lives, add your own protected files to `protected_paths`, and
-create `approved-remotes.txt` (see the example in `examples/`) listing the
-git remotes your agent is allowed to push to. An empty or missing
-`approved-remotes.txt` means `git push` is blocked from every tool call,
-unconditionally — fail closed, not fail open.
+`install.py` copies the three scripts into `<target>/bin/`, writes a
+`gate-guard.config.json` with `state_path` pointed at whatever state file you
+actually have, creates an empty `approved-remotes.txt` and the directories
+the logs land in, and registers the hook in `.claude/settings.json`.
+
+It is idempotent and non-destructive. An existing config, allowlist or
+settings file is preserved — the hook is **merged into** your existing
+`PreToolUse` hooks rather than replacing them, which is the thing that goes
+wrong when people paste the example block in by hand. Re-running it after a
+`git pull` is the upgrade path. Pass `--dry-run` to see the plan first:
+
+```
+agent-approval-gate -> /path/to/your-agent-project
+
+  [create]  bin/gate_guard.py
+  [create]  gate-guard.config.json   -- state_path -> agent-state.json
+  [create]  approved-remotes.txt   -- empty = all pushes blocked
+  [update]  .claude/settings.json   -- hook appended, your other hooks preserved
+```
+
+Then read `gate-guard.config.json` and add your own files to
+`protected_paths`. Note that `approved-remotes.txt` is created **empty**: an
+empty or missing allowlist blocks `git push` from every tool call,
+unconditionally — fail closed, not fail open. Add a line only when you mean
+it.
 
 No dependencies beyond the Python 3 standard library.
 
+## Verify it's actually live
+
+This is the part most setups skip, and it is the part that matters.
+
+**A `PreToolUse` hook fails silently.** If the path in `settings.json` is
+wrong, if the config didn't resolve, if the harness never reloaded its
+settings — the experience is identical to a hook that works perfectly:
+nothing visibly happens. You find out it was never running the first time
+your agent does the thing it was supposed to be stopped from doing.
+
+`verify.py` takes the hook command *as registered in your `settings.json`*
+and feeds it real probe payloads on stdin, the same shape your harness sends,
+then reads the exit code:
+
+```
+WIRING
+  PASS  hook registered in .claude/settings.json        env GATE_GUARD_CONFIG="..." python3 ".../bin/gate_guard.py"
+  PASS  hook script exists at the registered path       /p/bin/gate_guard.py
+  PASS  config resolves (via hook command)              /p/gate-guard.config.json
+  PASS  state file readable                             agent-state.json, trust tier 0
+  PASS  git push allowlist present                      0 approved remote(s)
+
+BEHAVIOR
+  PASS  POST to a payment API                           blocked [PAYMENT_API_WRITE]
+  PASS  opening a signup URL                            blocked [ACCOUNT_SIGNUP_FLOW]
+  PASS  moving funds out of a wallet                    blocked [FUND_MOVEMENT]
+  PASS  reading offline signing material                blocked [KEY_MATERIAL]
+  PASS  Write tool targeting agent-state.json (protected)  blocked [PROTECTED_FILE]
+  PASS  shell redirect into agent-state.json (protected)  blocked [PROTECTED_FILE_SHELL]
+  PASS  ordinary shell command                          allowed
+  PASS  GET from a payment API (reading is research)    allowed
+  ...
+15/15 probes behaved as expected
+```
+
+It checks **both directions**. Probes that should block are the obvious half;
+the probes that should be *allowed* matter just as much, because an
+over-blocking gate that fights every tool call is a gate you will turn off
+within a week — and then you have no gate at all.
+
+Probes are matched against the rule ids in your config, so if you replaced
+the default rule pack, probes for rules you removed report `SKIP` instead of
+failing. Tier-gated rules above your threshold are expected to *stop*
+blocking, and are checked that way. `verify.py` exits non-zero if anything
+failed, so it drops into CI.
+
+Re-run it after any change to `settings.json`, your config, or your rules.
+
+### One thing to expect: the gate blocks its own test fixtures
+
+A content-matching guard pointed at a codebase containing its own probe
+payloads will match them. `verify.py` was blocked by its own project's hook
+on the first attempt to write it — rule `PAYMENT_API_WRITE`, triggered by a
+line containing a payment API URL. `gate_guard.py` carries the same note
+about its key-material pattern.
+
+This is permanent, it will happen to you, and the fix is to split the literal
+across source lines or assemble it at runtime — **never** to loosen the rule
+so your editor is more comfortable. Both files document where they do this
+and why.
+
 ## Wiring it into Claude Code (or any harness with a `PreToolUse` hook)
+
+`install.py` does this for you. This section is what it writes, for anyone
+wiring it up by hand or adapting it to a different harness.
 
 Claude Code hooks are configured in `.claude/settings.json`. Add:
 
@@ -221,8 +305,18 @@ the shipped default rule pack directly against `gate_guard.py`'s pure
 decision function — no stdin/stdout plumbing, no subprocess. Run it with:
 
 ```bash
-python3 tests/test_gate_guard.py
+python3 tests/test_gate_guard.py    # 13 cases, rule-pack behavior
+python3 tests/test_install.py       # 21 cases, settings-merge safety
 ```
+
+`tests/test_install.py` covers the installer's one genuinely destructive
+failure mode — an existing `.claude/settings.json` — asserting that unrelated
+keys and other hook events survive, that a second run doesn't duplicate the
+registration, that a stale hook path is rewritten in place, and that
+malformed settings raise rather than get overwritten.
+
+For end-to-end confidence in an actual install, `verify.py` is the tool —
+these two suites test the pieces, `verify.py` tests the wiring.
 
 This is not the adversarial suite referenced in the provenance note below.
 That suite lives in the private project this tool was extracted from, is
