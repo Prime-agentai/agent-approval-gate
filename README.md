@@ -1,11 +1,12 @@
 # agent-approval-gate
 
 Mechanical enforcement of "don't spend money, create accounts, or move funds
-without human approval" for an autonomous LLM agent — plus the approval
-queue that turns a block into a ticket, and a single-chokepoint state writer
-that protects the fields a human should own.
+without human approval" for an autonomous LLM agent — plus a measured spend
+ceiling and runaway-loop detector, the approval queue that turns a block into
+a ticket, and a single-chokepoint state writer that protects the fields a
+human should own.
 
-Three small, dependency-free Python scripts. No framework, no daemon, no
+Four small, dependency-free Python scripts. No framework, no daemon, no
 external service.
 
 ## The problem this solves
@@ -42,14 +43,17 @@ agent silently retrying or working around it.
 | `install.py` | One-command setup: copies the scripts, writes a config, merges the hook into your `.claude/settings.json` without clobbering existing hooks. Idempotent; `--dry-run` supported. |
 | `verify.py` | Fires real probe payloads through the hook *as your harness has it registered* and reports what actually blocked. The answer to "is this thing even running?" |
 | `gate_guard.py` | The `PreToolUse` hook. Reads the pending tool call on stdin, exits 0 (allow) or 2 (block). |
+| `budget_guard.py` | A second `PreToolUse` hook: blocks when the session's measured token spend crosses a ceiling, or when the agent starts repeating itself. Also runs standalone as a cost reporter. |
 | `approve.py` | The approval queue CLI: file a request, list what's pending, record a human's decision. |
 | `state.py` | The only sanctioned way to write an agent's state file — the chokepoint that keeps a human-owned field (like a trust tier) actually human-owned. |
-| `gate-guard.config.example.json` | Copy to `gate-guard.config.json` in your project root and edit. Every path and rule in the three scripts above is driven by this file. |
+| `gate-guard.config.example.json` | Copy to `gate-guard.config.json` in your project root and edit. Every path and rule in `gate_guard.py`, `approve.py` and `state.py` is driven by this file. |
+| `budget-guard.config.example.json` | Copy to `budget-guard.config.json`. Prices, ceilings and loop-detector thresholds. |
 | `examples/claude-code-settings.json` | How to register `gate_guard.py` as a Claude Code `PreToolUse` hook. |
 | `examples/approved-remotes.example.txt` | Format for the git-push allowlist. |
 | `examples/STATE.example.json` | Minimal shape `state.py` expects. |
 | `tests/test_gate_guard.py` | A small sanity suite for the default rule pack (13 cases). Not a security audit — see "Testing" below. |
-| `tests/test_install.py` | 21 cases pinning down the settings merge: existing hooks survive, re-running doesn't duplicate, malformed settings are refused rather than overwritten. |
+| `tests/test_install.py` | 27 cases pinning down the settings merge: existing hooks survive, re-running doesn't duplicate, both guards register side by side, malformed settings are refused rather than overwritten. |
+| `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -274,6 +278,106 @@ agent is inferring. That discipline lives in how you call the script, not in
 code the script can enforce, but the append-only ledger it produces is what
 makes a claim checkable after the fact.
 
+## `budget_guard.py` — the spend ceiling and loop detector
+
+The approval gate answers "is this action allowed?" It has nothing to say
+about the failure that actually empties people's accounts: an agent that is
+allowed to do everything it's doing, and does it four thousand times. No
+individual tool call in a runaway loop is suspicious. The bill is.
+
+`budget_guard.py` is a second `PreToolUse` hook covering that case, with two
+independent checks. Either one blocks the pending call.
+
+**The cost ceiling** reads your harness's own transcript file — the JSONL
+path the hook payload hands it — sums the token usage the API actually
+reported, prices it, and blocks once the session or the rolling day crosses a
+ceiling you set. It does not ask the agent how much it has spent. An agent
+has no reliable view of its own token usage, and a runaway loop is precisely
+the state in which its self-report is least trustworthy.
+
+Two details in there are easy to get wrong, and both were found by running
+this against real transcripts rather than by reasoning about the format:
+
+- **Streamed messages are written to the transcript repeatedly** as they
+  grow. In a real session, 49 assistant lines represented 25 messages.
+  Summing line by line overstates spend by roughly 2×, so usage is
+  deduplicated by message id, last write winning.
+- **Cache reads bill at 0.1× the input rate**, 5-minute cache writes at
+  1.25×, 1-hour writes at 2×. A long agent session is overwhelmingly cache
+  reads. Pricing them at the full input rate — the obvious shortcut —
+  overstates cost by about an order of magnitude and makes any ceiling you
+  set meaningless.
+
+**The loop detector** fingerprints each pending call (tool name plus
+canonicalised arguments) and blocks on the *N*th identical call in a row, or
+on *M* occurrences of the same call inside a rolling window. The window rule
+is the one that earns its keep: a stuck agent usually alternates A, B, A, B
+rather than repeating A four times, and a consecutive-only check sails right
+past that.
+
+### Honesty about the dollar figures
+
+**They are list-price estimates, not your bill.** If you're on a subscription
+plan rather than metered API credit, no invoice will match this number. It is
+useful as a proportional signal ("this session cost 6× the last one") and as
+a ceiling to stop runaways — not as an accounting record. The price table
+ships in config specifically so you can replace it with your contracted
+rates. Don't let an agent quote this number as a fact about your spend.
+
+A model ID missing from the price table — which is what a newly released
+model looks like from here — is billed at your highest configured rate by
+default, so an unrecognised model over-reports rather than silently costing
+zero and gliding past the ceiling.
+
+### It fails open, and that's deliberate
+
+If the transcript is missing or unparseable, this hook **allows** the call and
+logs why. `gate_guard.py` fails closed because over-blocking a payment costs
+little; this one fails open because an unreadable transcript would otherwise
+block every tool call, turning a bookkeeping problem into a total outage.
+It's a budget control, not a safety control. Don't repurpose it as one.
+
+### Standalone: what did that session cost?
+
+No hook required. Point it at any transcript:
+
+```bash
+python3 budget_guard.py report ~/.claude/projects/<project>/<session>.jsonl
+```
+
+```
+25 API responses (deduplicated by message id)
+
+model                     responses    est. USD
+-----------------------------------------------
+claude-opus-5                    25      1.5652
+-----------------------------------------------
+total                            25      1.5652
+```
+
+### Configuration
+
+`install.py` installs it by default and writes `budget-guard.config.json`
+with a $10/session and $40/day ceiling. Pass `--no-budget-guard` to install
+the approval gate alone; set either ceiling to `null` to keep the loop
+detector without the spend check.
+
+| Key | Meaning |
+|---|---|
+| `session_cost_ceiling_usd` | Blocks when this session's estimated spend reaches it. `null` disables. |
+| `daily_cost_ceiling_usd` | Same, summed across every session that ran today. `null` disables. |
+| `warn_at_fraction` | Warn on stderr once spend crosses this fraction of a ceiling. |
+| `pricing_usd_per_mtok` | Per-model input/output rates. Replace with your contracted rates. |
+| `cache_multipliers` | Cache read/write rates as ratios of the input rate. |
+| `unknown_model_policy` | `priciest` (default) or `ignore`, for model IDs not in the table. |
+| `loop_detector.consecutive_repeats` | Block on the *N*th identical call in a row. `0` disables this rule. |
+| `loop_detector.window` / `.max_repeats` | Block on *max_repeats* occurrences inside the last *window* calls. |
+| `loop_detector.ignore_tools` | Tools whose repetition is meaningful rather than stuck. |
+
+Blocks are appended to `approvals/budget-blocked.jsonl`. Per-session
+fingerprint windows and the daily rollup live in `.budget-guard/` and are
+pruned after `state_ttl_days`.
+
 ## Configuration reference
 
 All three scripts share one config file. See
@@ -306,8 +410,15 @@ decision function — no stdin/stdout plumbing, no subprocess. Run it with:
 
 ```bash
 python3 tests/test_gate_guard.py    # 13 cases, rule-pack behavior
-python3 tests/test_install.py       # 21 cases, settings-merge safety
+python3 tests/test_install.py       # 27 cases, settings-merge safety
+python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
 ```
+
+`tests/test_budget_guard.py` concentrates on the cases where a plausible
+implementation reports a confidently wrong number: transcript duplicates
+(overstates spend ~2×), cache reads priced at the full input rate
+(overstates ~10×), and an unrecognised model priced at zero (a ceiling that
+never trips). Each has a named test.
 
 `tests/test_install.py` covers the installer's one genuinely destructive
 failure mode — an existing `.claude/settings.json` — asserting that unrelated

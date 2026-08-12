@@ -40,7 +40,7 @@ import os
 import shutil
 import sys
 
-SCRIPTS = ("gate_guard.py", "approve.py", "state.py")
+SCRIPTS = ("gate_guard.py", "approve.py", "state.py", "budget_guard.py")
 
 # Checked in order; the first one that exists wins. If none exist we fall
 # back to STATE.json and say so -- gate_guard.py fails closed to tier 0 when
@@ -111,20 +111,24 @@ def build_config(source_dir, state_path):
     return config
 
 
-def hook_command(python_bin, config_path, guard_path):
+def hook_command(python_bin, env_var, config_path, guard_path):
     return (
-        f"env GATE_GUARD_CONFIG={json.dumps(config_path)} "
+        f"env {env_var}={json.dumps(config_path)} "
         f"{python_bin} {json.dumps(guard_path)}"
     )
 
 
-def merge_settings(existing, command):
-    """Add our PreToolUse hook to a Claude Code settings object without
+def merge_settings(existing, command, marker):
+    """Add one PreToolUse hook to a Claude Code settings object without
     disturbing anything else in it.
 
+    `marker` is the script filename used to recognise a previous
+    registration of *this* hook -- it is what makes the function safe to call
+    once per guard without the second call clobbering the first.
+
     Returns (new_settings, action) where action is 'create', 'update' (an
-    older gate_guard registration was rewritten), 'add' (we appended a new
-    matcher) or 'same'.
+    older registration of the same script was rewritten), 'add' (we appended
+    a new matcher) or 'same'.
 
     This is the step people get wrong by hand -- settings.json usually
     already has hooks in it, and the natural move of pasting the example over
@@ -141,7 +145,7 @@ def merge_settings(existing, command):
 
     for entry in pre:
         for hook in entry.get("hooks", []) or []:
-            if "gate_guard.py" in str(hook.get("command", "")):
+            if marker in str(hook.get("command", "")):
                 if hook["command"] == command:
                     return settings, "same"
                 hook["command"] = command
@@ -167,6 +171,9 @@ def main():
                     help="Print the plan without writing anything")
     ap.add_argument("--force", action="store_true",
                     help="Allow installing into the repo directory itself")
+    ap.add_argument("--no-budget-guard", action="store_true",
+                    help="Install the approval gate only, without the spend "
+                         "ceiling and loop detector")
     args = ap.parse_args()
 
     source_dir = os.path.dirname(os.path.abspath(__file__))
@@ -187,14 +194,17 @@ def main():
 
     bin_dir = os.path.join(target, args.bin_dir)
     config_path = os.path.join(target, "gate-guard.config.json")
+    budget_config_path = os.path.join(target, "budget-guard.config.json")
     remotes_path = os.path.join(target, "approved-remotes.txt")
     settings_path = os.path.join(target, ".claude", "settings.json")
 
     state_path, state_found = detect_state_path(target)
+    scripts = tuple(s for s in SCRIPTS
+                    if not (args.no_budget_guard and s == "budget_guard.py"))
     plan = []
 
-    # 1. the three scripts
-    for name in SCRIPTS:
+    # 1. the scripts
+    for name in scripts:
         src = os.path.join(source_dir, name)
         dst = os.path.join(bin_dir, name)
         if os.path.isfile(dst):
@@ -213,6 +223,18 @@ def main():
                 else f"state_path -> {state_path} (not found; edit this if wrong)")
         plan.append(Planned("create", config_path, note))
 
+    if not args.no_budget_guard:
+        if os.path.isfile(budget_config_path):
+            plan.append(Planned("skip", budget_config_path,
+                                "already exists, left untouched"))
+        else:
+            example = json.load(open(os.path.join(
+                source_dir, "budget-guard.config.example.json")))
+            plan.append(Planned(
+                "create", budget_config_path,
+                f"ceilings: ${example['session_cost_ceiling_usd']}/session, "
+                f"${example['daily_cost_ceiling_usd']}/day (list-price est.)"))
+
     # 3. allowlist + the directories the logs land in
     if os.path.isfile(remotes_path):
         plan.append(Planned("skip", remotes_path, "already exists, left untouched"))
@@ -222,18 +244,35 @@ def main():
     config_for_dirs = (json.load(open(config_path)) if os.path.isfile(config_path)
                        else build_config(source_dir, state_path))
     log_dirs = set()
-    for key in ("blocked_log", "queue_path", "decisions_path", "ledger_path"):
-        rel = config_for_dirs.get(key)
-        if rel:
-            d = os.path.dirname(os.path.join(target, rel))
-            if d and not os.path.isdir(d):
-                log_dirs.add(d)
+    dir_sources = [(config_for_dirs,
+                    ("blocked_log", "queue_path", "decisions_path", "ledger_path"))]
+    if not args.no_budget_guard:
+        budget_cfg = (json.load(open(budget_config_path))
+                      if os.path.isfile(budget_config_path)
+                      else json.load(open(os.path.join(
+                          source_dir, "budget-guard.config.example.json"))))
+        dir_sources.append((budget_cfg, ("blocked_log",)))
+        # state_dir is a directory in its own right, not a file path
+        state_rel = budget_cfg.get("state_dir")
+        if state_rel and not os.path.isdir(os.path.join(target, state_rel)):
+            log_dirs.add(os.path.join(target, state_rel))
+    for source, keys in dir_sources:
+        for key in keys:
+            rel = source.get(key)
+            if rel:
+                d = os.path.dirname(os.path.join(target, rel))
+                if d and not os.path.isdir(d):
+                    log_dirs.add(d)
     for d in sorted(log_dirs):
         plan.append(Planned("create", d, "log directory"))
 
-    # 4. hook registration
-    command = hook_command(args.python, config_path,
-                           os.path.join(bin_dir, "gate_guard.py"))
+    # 4. hook registration -- one entry per guard, each recognised by its own
+    #    script name so re-running never clobbers the other one.
+    registrations = [("gate_guard.py", "GATE_GUARD_CONFIG", config_path)]
+    if not args.no_budget_guard:
+        registrations.append(
+            ("budget_guard.py", "BUDGET_GUARD_CONFIG", budget_config_path))
+
     existing_settings = None
     if os.path.isfile(settings_path):
         try:
@@ -242,19 +281,28 @@ def main():
         except json.JSONDecodeError as e:
             sys.exit(f"error: {settings_path} is not valid JSON ({e}). "
                      f"Refusing to touch it -- fix or move it and re-run.")
-    try:
-        new_settings, action = merge_settings(existing_settings, command)
-    except ValueError as e:
-        sys.exit(f"error: {settings_path}: {e}. Refusing to touch it.")
+
+    new_settings, actions = existing_settings, []
+    for marker, env_var, cfg in registrations:
+        command = hook_command(args.python, env_var, cfg,
+                               os.path.join(bin_dir, marker))
+        try:
+            new_settings, action = merge_settings(new_settings, command, marker)
+        except ValueError as e:
+            sys.exit(f"error: {settings_path}: {e}. Refusing to touch it.")
+        actions.append((marker, action))
+
     notes = {
-        "same": "hook already registered, unchanged",
-        "update": "existing gate_guard hook command rewritten",
+        "same": "already registered, unchanged",
+        "update": "existing hook command rewritten",
         "add": "hook appended, your other hooks preserved",
         "create": "new settings file with the hook registered",
     }
-    plan.append(Planned("skip" if action == "same" else
-                        ("update" if action in ("update", "add") else "create"),
-                        settings_path, notes[action]))
+    for marker, action in actions:
+        plan.append(Planned("skip" if action == "same" else
+                            ("update" if action in ("update", "add") else "create"),
+                            settings_path, f"{marker}: {notes[action]}"))
+    settings_changed = any(a != "same" for _m, a in actions)
 
     # ---- report, then execute ----
     print(f"agent-approval-gate -> {target}\n")
@@ -267,13 +315,17 @@ def main():
         return
 
     os.makedirs(bin_dir, exist_ok=True)
-    for name in SCRIPTS:
+    for name in scripts:
         shutil.copy2(os.path.join(source_dir, name), os.path.join(bin_dir, name))
 
     if not os.path.isfile(config_path):
         with open(config_path, "w") as f:
             json.dump(build_config(source_dir, state_path), f, indent=2)
             f.write("\n")
+
+    if not args.no_budget_guard and not os.path.isfile(budget_config_path):
+        shutil.copy2(os.path.join(source_dir, "budget-guard.config.example.json"),
+                     budget_config_path)
 
     if not os.path.isfile(remotes_path):
         with open(remotes_path, "w") as f:
@@ -282,7 +334,7 @@ def main():
     for d in sorted(log_dirs):
         os.makedirs(d, exist_ok=True)
 
-    if action != "same":
+    if settings_changed:
         os.makedirs(os.path.dirname(settings_path), exist_ok=True)
         with open(settings_path, "w") as f:
             json.dump(new_settings, f, indent=2)
@@ -291,6 +343,14 @@ def main():
     print("Installed. Next:")
     print(f"  1. Read {os.path.relpath(config_path, target)} and adjust "
           f"protected_paths for your project.")
+    if not args.no_budget_guard:
+        cfg = json.load(open(budget_config_path))
+        print(f"     Spend ceilings are live in "
+              f"{os.path.relpath(budget_config_path, target)}: "
+              f"${cfg['session_cost_ceiling_usd']} per session, "
+              f"${cfg['daily_cost_ceiling_usd']} per day. These are "
+              f"LIST-PRICE ESTIMATES, not your bill -- set them to numbers "
+              f"that mean something to you, or null to disable.")
     if not state_found:
         print(f"  2. No state file was found. If your agent has one, set "
               f"state_path in the config -- until then the hook fails closed "

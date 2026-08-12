@@ -1,0 +1,44 @@
+{
+  "_comment": "Copy to budget-guard.config.json and edit. Every dollar figure here is a LIST-PRICE ESTIMATE computed from the token usage in your harness's own transcript. If you are on a subscription plan, no invoice matches it -- it is a proportional signal and a ceiling, not an accounting record.",
+
+  "_comment_pricing": "Per-million-token published rates, verified 2026-08-12. Replace with your contracted rates if you have them. Cache rates are derived from the input rate by cache_multipliers below.",
+  "pricing_usd_per_mtok": {
+    "claude-fable-5":    { "input": 10.0, "output": 50.0 },
+    "claude-mythos-5":   { "input": 10.0, "output": 50.0 },
+    "claude-opus-5":     { "input": 5.0,  "output": 25.0 },
+    "claude-opus-4-8":   { "input": 5.0,  "output": 25.0 },
+    "claude-opus-4-7":   { "input": 5.0,  "output": 25.0 },
+    "claude-opus-4-6":   { "input": 5.0,  "output": 25.0 },
+    "claude-sonnet-5":   { "input": 3.0,  "output": 15.0 },
+    "claude-sonnet-4-6": { "input": 3.0,  "output": 15.0 },
+    "claude-haiku-4-5":  { "input": 1.0,  "output": 5.0 }
+  },
+
+  "_comment_cache": "Fixed ratios of the input rate. A long agent session is mostly cache reads -- pricing them at the full input rate overstates cost by roughly 10x and makes any ceiling meaningless.",
+  "cache_multipliers": {
+    "cache_read": 0.1,
+    "cache_write_5m": 1.25,
+    "cache_write_1h": 2.0
+  },
+
+  "_comment_unknown": "What to charge for a model ID missing from the table -- which is what a newly released model looks like from here. 'priciest' bills it at your highest configured rate so it over-reports rather than silently costing zero. 'ignore' charges nothing and is a bad default for a spend control.",
+  "unknown_model_policy": "priciest",
+
+  "_comment_ceilings": "USD. null disables a ceiling. Crossing one blocks the pending tool call; it does not kill the session, so the agent can still write its summary.",
+  "session_cost_ceiling_usd": 10.0,
+  "daily_cost_ceiling_usd": 40.0,
+  "warn_at_fraction": 0.75,
+
+  "_comment_loop": "consecutive_repeats blocks the Nth identical call in a row. The window rule blocks max_repeats occurrences of the same call inside the last `window` calls even when they are not back to back -- a stuck agent usually alternates A,B,A,B, so a consecutive-only check misses the common case. Set either to 0 to disable that rule alone.",
+  "loop_detector": {
+    "enabled": true,
+    "consecutive_repeats": 4,
+    "window": 20,
+    "max_repeats": 6,
+    "ignore_tools": []
+  },
+
+  "state_dir": ".budget-guard",
+  "blocked_log": "approvals/budget-blocked.jsonl",
+  "state_ttl_days": 7
+}

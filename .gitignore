@@ -6,3 +6,5 @@ approved-remotes.txt
 approvals/
 ledger/
 gate-guard.config.json
+budget-guard.config.json
+.budget-guard/
