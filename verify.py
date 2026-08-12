@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-verify.py -- prove the gate is actually live, and actually blocking.
+verify.py -- prove the guards are actually live, and actually blocking.
 
     python3 verify.py --target /path/to/your-agent-project
+
+Covers both hooks this repo installs: gate_guard.py (is this action allowed?)
+and budget_guard.py (has this session already cost more than you agreed to
+spend, and is it still making progress?). A project that installed only the
+approval gate is fine -- the budget section reports SKIP, not FAIL.
 
 A PreToolUse hook fails silently. If the path in settings.json is wrong, if
 the config didn't resolve, if the harness never reloaded its settings, you
@@ -30,10 +35,37 @@ Probes are derived from the rule ids present in your config. If you replaced
 the default rule pack, probes for rules you removed are reported as SKIP
 rather than counted as failures -- your rules are yours.
 
-Blocked probes append to your configured blocked_log, because that is what
-the hook does and suppressing it would mean testing something other than
+Blocked gate probes append to your configured blocked_log, because that is
+what the hook does and suppressing it would mean testing something other than
 production. Every probe command contains the string "gate-verify-probe" so
 you can filter them back out of the audit trail.
+
+BUDGET PROBES ARE ISOLATED, AND FOR A REASON WORTH STATING. A gate probe's
+only side effect is an audit line. A budget probe's is not: budget_guard.py
+records each session's cost into a shared daily rollup under its state_dir,
+and that rollup decides whether the NEXT call is blocked. Probing a $20
+synthetic session against your real state_dir would leave $20 of imaginary
+spend sitting in today's total for the rest of the day -- quite possibly
+enough to trip your daily ceiling and stop your actual agent. So every budget
+probe runs the registered script against a throwaway config in a temp
+directory, with only state_dir and blocked_log redirected; the ceilings, the
+price table and the loop thresholds are your real ones, read from your real
+config. Your spend ledger is never written to. The temp directory is removed
+when the run finishes.
+
+Three of the budget probes test arithmetic rather than plumbing, because the
+cost ceiling is only as trustworthy as the pricing underneath it:
+
+  - Cache reads bill at 0.1x the input rate. Priced at the full input rate --
+    the obvious shortcut -- a mostly-cached agent session overstates by
+    roughly 10x and your ceiling stops meaning anything.
+  - A streamed assistant message is rewritten to the transcript as it grows,
+    so summing line by line double-counts. Usage is deduplicated by message id.
+  - An unrecognised model ID -- which is what a newly released model looks
+    like -- must still be billed, or it sails past the ceiling for free.
+
+Each is probed by constructing a transcript that lands on the safe side of
+your ceiling only if that rule is implemented correctly.
 
 A note on how the probe strings below are built. Several are assembled from
 fragments at runtime rather than written as single literals -- the payment
@@ -52,8 +84,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # --- probe payload fragments (see the docstring's note on the splits) ---
 
@@ -130,9 +164,13 @@ def build_probes(config, state_abspath):
     ]
 
 
-def find_hook_command(target):
+def find_hook_command(target, marker="gate_guard.py"):
     """Pull the registered hook command straight out of settings.json. Testing
-    anything else would be testing a hook your harness isn't running."""
+    anything else would be testing a hook your harness isn't running.
+
+    `marker` is the guard's script filename; both guards register their own
+    PreToolUse entry and are recognised by it.
+    """
     settings_path = os.path.join(target, ".claude", "settings.json")
     if not os.path.isfile(settings_path):
         return None, f"{settings_path} does not exist"
@@ -142,13 +180,14 @@ def find_hook_command(target):
     except json.JSONDecodeError as e:
         return None, f"settings.json is not valid JSON: {e}"
 
+    variants = (marker, marker.replace("_", "-"))
     pre = (settings.get("hooks") or {}).get("PreToolUse") or []
     for entry in pre:
         for hook in entry.get("hooks", []) or []:
             cmd = str(hook.get("command", ""))
-            if "gate_guard.py" in cmd or "gate-guard.py" in cmd:
+            if any(v in cmd for v in variants):
                 return cmd, None
-    return None, "no PreToolUse hook referencing gate_guard.py is registered"
+    return None, f"no PreToolUse hook referencing {marker} is registered"
 
 
 def resolve_config(command, target):
@@ -240,6 +279,435 @@ def configured_rule_ids(config):
     return ids
 
 
+# ---------------------------------------------------------------------------
+# budget_guard.py
+# ---------------------------------------------------------------------------
+
+BUDGET_MARKER = "budget_guard.py"
+UNKNOWN_MODEL = "zzz-unreleased-probe-model"
+
+
+def load_budget_module(guard_path):
+    """Import the installed budget_guard.py to reuse its own default config
+    and price table.
+
+    This is deliberately narrow: nothing here calls its decision functions.
+    Probes still go through the registered command as a subprocess, the same
+    as the gate probes. The import exists so the probe transcripts can be
+    sized against YOUR merged config -- restating the default price table in
+    this file would drift from it the first time either one changed.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_bg_probe", guard_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def merge_budget_config(module, user_config):
+    """Merge a user config over the module's defaults one level deep --
+    the same shallow merge load_config() documents, so a config that
+    overrides one loop-detector field doesn't have to restate the rest."""
+    merged = json.loads(json.dumps(getattr(module, "DEFAULT_CONFIG", {})))
+    for key, value in (user_config or {}).items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def resolve_budget_config(command, target, guard_path):
+    """Resolve the config the way budget_guard.py will: the env var in the
+    hook command, then the working directory, then next to the script."""
+    m = re.search(r"BUDGET_GUARD_CONFIG=(\"[^\"]+\"|'[^']+'|\S+)", command)
+    if m:
+        path = m.group(1).strip("\"'")
+        if not os.path.isabs(path):
+            path = os.path.join(target, path)
+        return path, "hook command"
+    for candidate, origin in (
+        (os.path.join(target, "budget-guard.config.json"), "project root"),
+        (os.path.join(os.path.dirname(guard_path), "budget-guard.config.json"),
+         "next to the script"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate, origin
+    return None, "built-in defaults"
+
+
+def writable(directory):
+    """Can the hook actually persist state here? If it cannot, check_loop
+    swallows the OSError by design and the loop window silently never
+    accumulates -- the detector reports nothing and looks healthy."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        probe = os.path.join(directory, ".verify-write-probe")
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def check_budget_wiring(target):
+    """Returns (rows, command, merged_config). command is None when the
+    budget guard is not installed, which is a supported choice, not a fault."""
+    rows = []
+    command, err = find_hook_command(target, BUDGET_MARKER)
+    if not command:
+        rows.append((SKIP, "hook registered in .claude/settings.json",
+                     f"{err} -- skipping (install.py --no-budget-guard is a "
+                     f"supported choice)"))
+        return rows, None, None
+    rows.append((PASS, "hook registered in .claude/settings.json", command))
+
+    m = re.search(r"(\S*budget[_-]guard\.py)", command)
+    guard = (m.group(1).strip("\"'") if m else "")
+    if not os.path.isabs(guard):
+        guard = os.path.join(target, guard)
+    if os.path.isfile(guard):
+        rows.append((PASS, "hook script exists at the registered path", guard))
+    else:
+        rows.append((FAIL, "hook script exists at the registered path",
+                     f"not found: {guard}"))
+        return rows, None, None
+
+    config_path, origin = resolve_budget_config(command, target, guard)
+    user_config = {}
+    if config_path and os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                user_config = json.load(f)
+            rows.append((PASS, f"config resolves (via {origin})", config_path))
+        except json.JSONDecodeError as e:
+            rows.append((FAIL, f"config resolves (via {origin})",
+                         f"{config_path}: invalid JSON: {e} -- the hook falls "
+                         f"back to built-in defaults, NOT your ceilings"))
+    elif config_path:
+        rows.append((WARN, "config resolves",
+                     f"{config_path} not found -- the hook falls back to its "
+                     f"built-in defaults, NOT your ceilings"))
+    else:
+        rows.append((WARN, "config resolves", "no config file found anywhere "
+                     "on the resolution path -- built-in defaults are in force"))
+
+    module = load_budget_module(guard)
+    if module is None:
+        rows.append((FAIL, "hook script imports cleanly",
+                     f"{guard} raised on import -- the hook cannot run"))
+        return rows, None, None
+    config = merge_budget_config(module, user_config)
+
+    session_ceiling = config.get("session_cost_ceiling_usd")
+    day_ceiling = config.get("daily_cost_ceiling_usd")
+    detail = (f"session {'off' if session_ceiling is None else f'${session_ceiling:.2f}'}, "
+              f"daily {'off' if day_ceiling is None else f'${day_ceiling:.2f}'}")
+    if session_ceiling is None and day_ceiling is None:
+        rows.append((WARN, "a cost ceiling is configured",
+                     "both ceilings are null -- the loop detector still runs, "
+                     "but nothing stops a slow expensive session"))
+    else:
+        rows.append((PASS, "a cost ceiling is configured", detail))
+
+    cache_read = (config.get("cache_multipliers") or {}).get("cache_read")
+    if not config.get("pricing_usd_per_mtok"):
+        rows.append((FAIL, "price table is populated",
+                     "empty -- every model prices at $0 and no ceiling can trip"))
+    elif cache_read is None or cache_read >= 1:
+        rows.append((WARN, "cache reads priced below the input rate",
+                     f"cache_read multiplier is {cache_read} -- agent sessions "
+                     f"are mostly cache reads, so this overstates spend and "
+                     f"trips ceilings early"))
+    else:
+        rows.append((PASS, "price table is populated",
+                     f"{len(config['pricing_usd_per_mtok'])} models, cache "
+                     f"reads at {cache_read}x input"))
+
+    loop = config.get("loop_detector") or {}
+    if loop.get("enabled", True):
+        rows.append((PASS, "loop detector enabled",
+                     f"{loop.get('consecutive_repeats')} consecutive, "
+                     f"{loop.get('max_repeats')} in a window of "
+                     f"{loop.get('window')}"))
+    else:
+        rows.append((WARN, "loop detector enabled",
+                     "disabled in config -- a stuck agent will not be stopped"))
+
+    root = os.path.dirname(config_path) if config_path else target
+    config["_project_root"] = root
+    state = os.path.join(root, config.get("state_dir", ".budget-guard"))
+    if writable(state):
+        rows.append((PASS, "state directory writable", state))
+    else:
+        rows.append((FAIL, "state directory writable",
+                     f"{state} is not writable -- the loop window cannot "
+                     f"persist, so the detector silently never fires"))
+
+    log_dir = os.path.dirname(os.path.join(
+        root, config.get("blocked_log", "approvals/budget-blocked.jsonl")))
+    if writable(log_dir):
+        rows.append((PASS, "blocked-log directory writable", log_dir))
+    else:
+        rows.append((WARN, "blocked-log directory writable",
+                     f"{log_dir} is not writable -- blocks still happen but "
+                     f"go unrecorded"))
+
+    return rows, command, config
+
+
+def transcript(path, messages):
+    """Write a synthetic transcript in the harness's own JSONL shape.
+    `messages` is a list of (message_id, model, usage)."""
+    with open(path, "w") as f:
+        for message_id, model, usage in messages:
+            f.write(json.dumps({
+                "type": "assistant",
+                "message": {"id": message_id, "model": model, "usage": usage},
+            }) + "\n")
+    return path
+
+
+def tokens_for(usd, rate_per_mtok, multiplier=1.0):
+    """How many tokens cost `usd` at a per-million rate. Rounded up so a
+    probe aimed above a ceiling lands above it rather than on the boundary."""
+    if rate_per_mtok <= 0:
+        return 0
+    return int(usd * 1_000_000 / (rate_per_mtok * multiplier)) + 1
+
+
+def budget_probe_config(root, config, **overrides):
+    """Write a throwaway config into its own directory.
+
+    A fresh directory per probe is not tidiness. budget_guard keys the daily
+    rollup by session id inside state_dir, so probes sharing one would
+    accumulate each other's synthetic spend and the third probe would fail
+    because of the second. Each probe gets its own world.
+    """
+    os.makedirs(root, exist_ok=True)
+    probe = json.loads(json.dumps(
+        {k: v for k, v in config.items() if not k.startswith("_")}))
+    probe.update(overrides)
+    probe["state_dir"] = ".budget-guard"
+    probe["blocked_log"] = "budget-blocked.jsonl"
+    path = os.path.join(root, "budget-guard.config.json")
+    with open(path, "w") as f:
+        json.dump(probe, f)
+    return path
+
+
+def with_config(command, config_path):
+    """Point the registered command at a probe config. Rewrites the env
+    assignment install.py writes, or adds one if the command has none."""
+    quoted = json.dumps(config_path)
+    if re.search(r"BUDGET_GUARD_CONFIG=(\"[^\"]+\"|'[^']+'|\S+)", command):
+        return re.sub(r"BUDGET_GUARD_CONFIG=(\"[^\"]+\"|'[^']+'|\S+)",
+                      f"BUDGET_GUARD_CONFIG={quoted}", command)
+    return f"env BUDGET_GUARD_CONFIG={quoted} {command}"
+
+
+def budget_payload(session_id, transcript_path="", tool="Bash", command="ls"):
+    return {
+        "session_id": session_id,
+        "transcript_path": transcript_path,
+        "tool_name": tool,
+        "tool_input": {"command": command},
+    }
+
+
+def run_budget_probes(command, config, target, workdir):
+    """Yields (status, description, detail). Each probe is self-contained:
+    its own config, its own state directory, its own synthetic transcript."""
+    model = ("claude-opus-5" if "claude-opus-5" in config["pricing_usd_per_mtok"]
+             else next(iter(config["pricing_usd_per_mtok"]), ""))
+    row = config["pricing_usd_per_mtok"].get(model) or {"input": 0, "output": 0}
+    in_rate = row["input"]
+    cache_mult = (config.get("cache_multipliers") or {}).get("cache_read", 0.1)
+    session_ceiling = config.get("session_cost_ceiling_usd")
+    day_ceiling = config.get("daily_cost_ceiling_usd")
+    counter = [0]
+
+    def run(desc, payload, expect, expect_rule=None, **overrides):
+        counter[0] += 1
+        root = os.path.join(workdir, f"probe{counter[0]}")
+        cfg = budget_probe_config(root, config, **overrides)
+        code, stderr = run_probe(with_config(command, cfg), payload, target)
+        blocked = code == 2
+        got = "blocked" if blocked else (
+            "allowed" if code == 0 else f"exit {code}")
+        m = re.search(r"BLOCKED BY BUDGET GUARD \[([A-Z_]+)\]", stderr)
+        rule = m.group(1) if m else None
+        if rule:
+            got = f"blocked [{rule}]"
+        ok = ((blocked and expect == "block") or (code == 0 and expect == "allow"))
+        if ok and expect_rule and rule != expect_rule:
+            ok, got = False, f"{got}  <-- expected rule {expect_rule}"
+        elif not ok:
+            got += f"  <-- expected {expect}"
+        return (PASS if ok else FAIL), desc, got
+
+    # --- cost ceiling ---
+    if in_rate <= 0:
+        yield SKIP, "cost ceiling probes", f"no usable input rate for {model}"
+    elif session_ceiling is None and day_ceiling is None:
+        yield SKIP, "cost ceiling probes", "no ceiling configured"
+    else:
+        ceiling = session_ceiling if session_ceiling is not None else day_ceiling
+        rule = "SESSION_BUDGET" if session_ceiling is not None else "DAILY_BUDGET"
+        # Isolate whichever ceiling we are not probing, so a block can only
+        # have come from the one under test.
+        other = ({"daily_cost_ceiling_usd": None} if session_ceiling is not None
+                 else {"session_cost_ceiling_usd": None})
+
+        under = transcript(os.path.join(workdir, "under.jsonl"), [
+            ("msg_under", model,
+             {"input_tokens": tokens_for(ceiling * 0.1, in_rate)})])
+        yield run("spend under the ceiling is allowed",
+                  budget_payload("verify-under", under), "allow", **other)
+
+        over = transcript(os.path.join(workdir, "over.jsonl"), [
+            ("msg_over", model,
+             {"input_tokens": tokens_for(ceiling * 2, in_rate)})])
+        yield run("spend over the ceiling blocks",
+                  budget_payload("verify-over", over), "block", rule, **other)
+
+        # Sized to 0.3x the ceiling at YOUR configured cache-read multiplier,
+        # not at a hardcoded 0.1 -- the probe tests that the multiplier is
+        # applied at all, whatever you set it to. If it is ignored and cache
+        # reads bill as fresh input, the same transcript costs 0.3/mult times
+        # the ceiling (30x at the default 0.1) and blocks.
+        cached = transcript(os.path.join(workdir, "cached.jsonl"), [
+            ("msg_cache", model,
+             {"cache_read_input_tokens":
+                 tokens_for(ceiling * 0.3, in_rate, cache_mult)})])
+        yield run(f"cache reads priced at the configured {cache_mult}x rate",
+                  budget_payload("verify-cache", cached), "allow", **other)
+
+        # One streamed message rewritten five times as it grew. Deduplicated
+        # by id it is 0.5x the ceiling; summed line by line it is 2.5x.
+        streamed = transcript(os.path.join(workdir, "streamed.jsonl"), [
+            ("msg_stream", model,
+             {"input_tokens": tokens_for(ceiling * 0.5, in_rate)})] * 5)
+        yield run("a streamed message is counted once, not once per line",
+                  budget_payload("verify-stream", streamed), "allow", **other)
+
+        # An unknown model ID is what a newly released model looks like from
+        # here. Under the default "priciest" policy it must still be billed.
+        if config.get("unknown_model_policy") == "ignore":
+            yield SKIP, "an unrecognised model is still billed", \
+                "unknown_model_policy is 'ignore' -- off by your config"
+        else:
+            priciest = max(config["pricing_usd_per_mtok"].values(),
+                           key=lambda r: r["output"])["input"]
+            unknown = transcript(os.path.join(workdir, "unknown.jsonl"), [
+                ("msg_unknown", UNKNOWN_MODEL,
+                 {"input_tokens": tokens_for(ceiling * 2, priciest)})])
+            yield run("an unrecognised model is still billed",
+                      budget_payload("verify-unknown", unknown), "block", rule,
+                      **other)
+
+        if session_ceiling is not None and day_ceiling is not None:
+            day = transcript(os.path.join(workdir, "day.jsonl"), [
+                ("msg_day", model,
+                 {"input_tokens": tokens_for(day_ceiling * 1.5, in_rate)})])
+            yield run("spend over the daily ceiling blocks",
+                      budget_payload("verify-day", day), "block",
+                      "DAILY_BUDGET", session_cost_ceiling_usd=None)
+
+    # --- loop detector ---
+    loop = config.get("loop_detector") or {}
+    if not loop.get("enabled", True):
+        yield SKIP, "loop detector probes", "disabled in your config"
+        return
+
+    consecutive = int(loop.get("consecutive_repeats", 4) or 0)
+    max_repeats = int(loop.get("max_repeats", 6) or 0)
+    window = max(1, int(loop.get("window", 20) or 1))
+    if "Bash" in (loop.get("ignore_tools") or []):
+        yield SKIP, "loop detector probes", "Bash is in your ignore_tools"
+        return
+
+    limits = [n for n in (consecutive, max_repeats) if n > 0]
+    if not limits:
+        yield SKIP, "loop detector probes", "both loop limits are disabled"
+        return
+    trip_at = min(limits)
+
+    def loop_sequence(desc, commands, expect_block_at, expect_rule=None):
+        """Replay a call sequence through one shared config, since the
+        window is stateful across calls by design."""
+        counter[0] += 1
+        root = os.path.join(workdir, f"probe{counter[0]}")
+        # transcript_path is empty so the cost check returns early and cannot
+        # confound the result: this probe is about repetition only.
+        cfg = budget_probe_config(root, config,
+                                  session_cost_ceiling_usd=None,
+                                  daily_cost_ceiling_usd=None)
+        cmd = with_config(command, cfg)
+        for i, call in enumerate(commands, start=1):
+            code, stderr = run_probe(
+                cmd, budget_payload("verify-loop", command=call), target)
+            m = re.search(r"BLOCKED BY BUDGET GUARD \[([A-Z_]+)\]", stderr)
+            rule = m.group(1) if m else None
+            if expect_block_at is None:
+                if code != 0:
+                    return FAIL, desc, f"call {i} of {len(commands)} was blocked [{rule}]"
+                continue
+            if i < expect_block_at and code != 0:
+                return FAIL, desc, f"blocked early, on call {i} of {expect_block_at}"
+            if i == expect_block_at:
+                if code != 2:
+                    return FAIL, desc, f"call {expect_block_at} was not blocked"
+                if expect_rule and rule != expect_rule:
+                    return FAIL, desc, f"blocked [{rule}], expected {expect_rule}"
+                return PASS, desc, f"blocked [{rule}] on call {i}"
+        return PASS, desc, f"{len(commands)} distinct calls, none blocked"
+
+    yield loop_sequence(
+        f"the same call {trip_at} times in a row blocks",
+        ["echo loop-probe  # budget-verify-probe"] * trip_at, trip_at)
+
+    # A,B,A,B never reaches the consecutive limit, so only the window rule can
+    # catch it -- and that is the shape a stuck agent actually produces.
+    if max_repeats > 0 and window >= 2 * max_repeats - 1 and max_repeats > 1:
+        alternating = []
+        for i in range(max_repeats):
+            alternating.append("echo alt-a  # budget-verify-probe")
+            if i < max_repeats - 1:
+                alternating.append("echo alt-b  # budget-verify-probe")
+        yield loop_sequence(
+            f"an alternating A,B loop blocks on the {max_repeats}th repeat",
+            alternating, len(alternating), "LOOP_WINDOW")
+    else:
+        yield SKIP, "an alternating A,B loop blocks", \
+            f"window {window} is too short for max_repeats {max_repeats}"
+
+    yield loop_sequence(
+        "distinct calls in a row are not blocked",
+        [f"echo distinct-{i}  # budget-verify-probe"
+         for i in range(trip_at + 2)], None)
+
+    # Documented behaviour, and the one people are most likely to assume is a
+    # bug: an unreadable transcript ALLOWS the call. This guard is a budget
+    # control, not a safety control, and bricking the agent over a missing log
+    # file would be the worse failure.
+    counter[0] += 1
+    root = os.path.join(workdir, f"probe{counter[0]}")
+    cfg = budget_probe_config(root, config)
+    missing = os.path.join(workdir, "no-such-transcript.jsonl")
+    code, _ = run_probe(with_config(command, cfg),
+                        budget_payload("verify-missing", missing), target)
+    yield ((PASS if code == 0 else FAIL),
+           "an unreadable transcript fails open, by design",
+           "allowed" if code == 0 else f"exit {code}  <-- expected allow")
+
+
 def run_probe(command, payload, target):
     proc = subprocess.run(
         ["sh", "-c", command],
@@ -254,11 +722,13 @@ def main():
         description="Verify an installed agent-approval-gate is live and blocking.")
     ap.add_argument("--target", default=os.getcwd(),
                     help="Project root to check (default: current directory)")
+    ap.add_argument("--skip-budget", action="store_true",
+                    help="Check only the approval gate, not the budget guard")
     args = ap.parse_args()
     target = os.path.abspath(args.target)
 
     print(f"agent-approval-gate: verifying {target}\n")
-    print("WIRING")
+    print("WIRING -- approval gate")
     rows, command, config, state_abspath = check_wiring(target)
     for status, label, detail in rows:
         print(f"  {status:<4}  {label:<46}  {detail}")
@@ -287,7 +757,7 @@ def main():
     tier_gated_ids = {r.get("id") for r in (config.get("tier_gated_rules") or [])} \
         or {"PACKAGE_INSTALL", "DOMAIN_REGISTRAR"}
 
-    print("\nBEHAVIOR")
+    print("\nBEHAVIOR -- approval gate")
     counts = {PASS: 0, FAIL: 0, SKIP: 0}
     blocks_logged = 0
     for rule_id, desc, payload, expect in build_probes(config, state_abspath):
@@ -318,19 +788,40 @@ def main():
         print(f"  {(PASS if ok else FAIL):<4}  {desc:<46}  {detail}{note}")
         counts[PASS if ok else FAIL] += 1
 
-    total = counts[PASS] + counts[FAIL]
-    print(f"\n{counts[PASS]}/{total} probes behaved as expected"
-          + (f", {counts[SKIP]} skipped" if counts[SKIP] else ""))
     if blocks_logged:
         log = config.get("blocked_log", "approvals/blocked.jsonl")
-        print(f"{blocks_logged} probe block(s) appended to {log} -- "
+        print(f"\n  {blocks_logged} probe block(s) appended to {log} -- "
               f"grep -v gate-verify-probe to filter them out.")
+
+    if not args.skip_budget:
+        print("\nWIRING -- budget guard")
+        brows, bcommand, bconfig = check_budget_wiring(target)
+        for status, label, detail in brows:
+            print(f"  {status:<4}  {label:<46}  {detail}")
+            if status == FAIL:
+                counts[FAIL] += 1
+
+        if bcommand and bconfig:
+            print("\nBEHAVIOR -- budget guard  (isolated: your spend state is "
+                  "never written to)")
+            workdir = tempfile.mkdtemp(prefix="budget-verify-")
+            try:
+                for status, desc, detail in run_budget_probes(
+                        bcommand, bconfig, target, workdir):
+                    print(f"  {status:<4}  {desc:<46}  {detail}")
+                    counts[status] = counts.get(status, 0) + 1
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    total = counts[PASS] + counts[FAIL]
+    print(f"\n{counts[PASS]}/{total} checks behaved as expected"
+          + (f", {counts[SKIP]} skipped" if counts[SKIP] else ""))
     if counts[FAIL]:
-        print("\nFAILures above mean the gate is not enforcing what you think "
+        print("\nFAILures above mean a guard is not enforcing what you think "
               "it is. Fix those before trusting it with an unattended agent.")
         return 1
-    print("\nThe gate is live and enforcing. Re-run this after any change to "
-          "settings.json, the config, or the rule pack.")
+    print("\nThe guards are live and enforcing. Re-run this after any change "
+          "to settings.json, either config, or the rule pack.")
     return 0
 
 

@@ -41,7 +41,7 @@ agent silently retrying or working around it.
 | File | Purpose |
 |---|---|
 | `install.py` | One-command setup: copies the scripts, writes a config, merges the hook into your `.claude/settings.json` without clobbering existing hooks. Idempotent; `--dry-run` supported. |
-| `verify.py` | Fires real probe payloads through the hook *as your harness has it registered* and reports what actually blocked. The answer to "is this thing even running?" |
+| `verify.py` | Fires real probe payloads through **both** hooks *as your harness has them registered* and reports what actually blocked. The answer to "is this thing even running?" Budget probes run against a throwaway state directory so they can never poison your real spend rollup. |
 | `gate_guard.py` | The `PreToolUse` hook. Reads the pending tool call on stdin, exits 0 (allow) or 2 (block). |
 | `budget_guard.py` | A second `PreToolUse` hook: blocks when the session's measured token spend crosses a ceiling, or when the agent starts repeating itself. Also runs standalone as a cost reporter. |
 | `approve.py` | The approval queue CLI: file a request, list what's pending, record a human's decision. |
@@ -54,6 +54,7 @@ agent silently retrying or working around it.
 | `tests/test_gate_guard.py` | A small sanity suite for the default rule pack (13 cases). Not a security audit — see "Testing" below. |
 | `tests/test_install.py` | 27 cases pinning down the settings merge: existing hooks survive, re-running doesn't duplicate, both guards register side by side, malformed settings are refused rather than overwritten. |
 | `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
+| `tests/test_verify.py` | 31 cases. Five deliberately break `budget_guard.py` and assert `verify.py` catches it — a verifier that passes a broken guard is worse than none. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -67,7 +68,7 @@ python3 install.py --target /path/to/your-agent-project
 python3 verify.py  --target /path/to/your-agent-project
 ```
 
-`install.py` copies the three scripts into `<target>/bin/`, writes a
+`install.py` copies the four scripts into `<target>/bin/`, writes a
 `gate-guard.config.json` with `state_path` pointed at whatever state file you
 actually have, creates an empty `approved-remotes.txt` and the directories
 the logs land in, and registers the hook in `.claude/settings.json`.
@@ -107,27 +108,48 @@ your agent does the thing it was supposed to be stopped from doing.
 
 `verify.py` takes the hook command *as registered in your `settings.json`*
 and feeds it real probe payloads on stdin, the same shape your harness sends,
-then reads the exit code:
+then reads the exit code. It covers **both** hooks — the approval gate and
+the budget guard:
 
 ```
-WIRING
+WIRING -- approval gate
   PASS  hook registered in .claude/settings.json        env GATE_GUARD_CONFIG="..." python3 ".../bin/gate_guard.py"
   PASS  hook script exists at the registered path       /p/bin/gate_guard.py
   PASS  config resolves (via hook command)              /p/gate-guard.config.json
   PASS  state file readable                             agent-state.json, trust tier 0
   PASS  git push allowlist present                      0 approved remote(s)
 
-BEHAVIOR
+BEHAVIOR -- approval gate
   PASS  POST to a payment API                           blocked [PAYMENT_API_WRITE]
   PASS  opening a signup URL                            blocked [ACCOUNT_SIGNUP_FLOW]
   PASS  moving funds out of a wallet                    blocked [FUND_MOVEMENT]
   PASS  reading offline signing material                blocked [KEY_MATERIAL]
   PASS  Write tool targeting agent-state.json (protected)  blocked [PROTECTED_FILE]
-  PASS  shell redirect into agent-state.json (protected)  blocked [PROTECTED_FILE_SHELL]
   PASS  ordinary shell command                          allowed
   PASS  GET from a payment API (reading is research)    allowed
   ...
-15/15 probes behaved as expected
+
+WIRING -- budget guard
+  PASS  hook registered in .claude/settings.json        env BUDGET_GUARD_CONFIG="..." python3 ".../bin/budget_guard.py"
+  PASS  a cost ceiling is configured                    session $10.00, daily $40.00
+  PASS  price table is populated                        9 models, cache reads at 0.1x input
+  PASS  loop detector enabled                           4 consecutive, 6 in a window of 20
+  PASS  state directory writable                        /p/.budget-guard
+  PASS  blocked-log directory writable                  /p/approvals
+
+BEHAVIOR -- budget guard  (isolated: your spend state is never written to)
+  PASS  spend under the ceiling is allowed              allowed
+  PASS  spend over the ceiling blocks                   blocked [SESSION_BUDGET]
+  PASS  cache reads priced at the configured 0.1x rate  allowed
+  PASS  a streamed message is counted once, not once per line  allowed
+  PASS  an unrecognised model is still billed           blocked [SESSION_BUDGET]
+  PASS  spend over the daily ceiling blocks             blocked [DAILY_BUDGET]
+  PASS  the same call 4 times in a row blocks           blocked [LOOP_CONSECUTIVE] on call 4
+  PASS  an alternating A,B loop blocks on the 6th repeat  blocked [LOOP_WINDOW] on call 11
+  PASS  distinct calls in a row are not blocked         6 distinct calls, none blocked
+  PASS  an unreadable transcript fails open, by design  allowed
+
+25/25 checks behaved as expected
 ```
 
 It checks **both directions**. Probes that should block are the obvious half;
@@ -138,10 +160,55 @@ within a week — and then you have no gate at all.
 Probes are matched against the rule ids in your config, so if you replaced
 the default rule pack, probes for rules you removed report `SKIP` instead of
 failing. Tier-gated rules above your threshold are expected to *stop*
-blocking, and are checked that way. `verify.py` exits non-zero if anything
-failed, so it drops into CI.
+blocking, and are checked that way. If you installed with
+`--no-budget-guard`, the budget section reports `SKIP` and the run still
+passes; `--skip-budget` omits it entirely. `verify.py` exits non-zero if
+anything failed, so it drops into CI.
 
-Re-run it after any change to `settings.json`, your config, or your rules.
+Re-run it after any change to `settings.json`, either config, or your rules.
+
+### Budget probes are isolated, and that is not just tidiness
+
+A gate probe's only side effect is a line in your audit log, so gate probes
+write to your real `blocked_log` — suppressing it would mean testing
+something other than production.
+
+A budget probe is different. `budget_guard.py` records each session's cost
+into a **shared daily rollup** under its `state_dir`, and that rollup decides
+whether the *next* call is blocked. Probing a $20 synthetic session against
+your real state would leave $20 of imaginary spend in today's total for the
+rest of the day — quite possibly enough to trip your daily ceiling and stop
+your actual agent.
+
+So every budget probe runs the registered script against a throwaway config
+in a temp directory, with only `state_dir` and `blocked_log` redirected. The
+ceilings, the price table and the loop thresholds are your real ones, read
+from your real config. Your spend ledger is never written to, and the temp
+directory is removed when the run finishes.
+
+### Three of the budget probes test arithmetic, not plumbing
+
+A cost ceiling is only as trustworthy as the pricing underneath it, and there
+are three ways to be confidently wrong about that pricing. Each is probed by
+constructing a transcript that lands on the safe side of *your* ceiling only
+if the rule is implemented correctly:
+
+| Probe | What a wrong implementation does |
+|---|---|
+| `cache reads priced at the configured 0.1x rate` | Bills cache reads as fresh input. Agent sessions are overwhelmingly cache reads, so spend overstates by ~10× and the ceiling stops meaning anything. |
+| `a streamed message is counted once, not once per line` | Sums the transcript line by line. A streamed message is rewritten as it grows — 49 lines for 25 messages in a real session — so spend overstates by ~2×. |
+| `an unrecognised model is still billed` | Prices an unknown model ID at $0. That is what a newly released model looks like from here, and it sails straight past the ceiling. |
+
+The cache probe is sized against *your* configured multiplier rather than a
+hardcoded `0.1`, so contracted rates don't produce a spurious failure — it
+tests that the multiplier is applied, not that it equals any particular value.
+
+Two further probes cover the parts people misread as bugs: an unreadable
+transcript **allows** the call (this is a budget control, not a safety
+control — bricking the agent over a missing log file is the worse failure),
+and `state directory writable` is checked because `check_loop` swallows a
+write error by design, so an unwritable `state_dir` means the loop detector
+silently never fires while looking perfectly healthy.
 
 ### One thing to expect: the gate blocks its own test fixtures
 
@@ -412,6 +479,7 @@ decision function — no stdin/stdout plumbing, no subprocess. Run it with:
 python3 tests/test_gate_guard.py    # 13 cases, rule-pack behavior
 python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
+python3 tests/test_verify.py        # 31 cases, incl. mutation tests on verify.py
 ```
 
 `tests/test_budget_guard.py` concentrates on the cases where a plausible
@@ -426,8 +494,20 @@ keys and other hook events survive, that a second run doesn't duplicate the
 registration, that a stale hook path is rewritten in place, and that
 malformed settings raise rather than get overwritten.
 
+`tests/test_verify.py` asks the only question worth asking about a verifier:
+does it report `FAIL` when the guard is genuinely broken? A verifier that
+green-lights a broken hook is worse than no verifier, because it converts an
+unknown into a false certainty. So five of its cases install a real project,
+**deliberately break `budget_guard.py`** one specific way each — remove the
+transcript deduplication, bill cache reads at the input rate, price unknown
+models at zero, make the loop window silently fail to persist, make an
+unreadable transcript fail closed — and assert that the run exits non-zero
+with the matching probe failing. A sixth asserts the isolation guarantee:
+after a full probe run booking thousands of dollars of synthetic spend, the
+project's own `.budget-guard/` still contains no rollup and no loop state.
+
 For end-to-end confidence in an actual install, `verify.py` is the tool —
-these two suites test the pieces, `verify.py` tests the wiring.
+these suites test the pieces, `verify.py` tests the wiring.
 
 This is not the adversarial suite referenced in the provenance note below.
 That suite lives in the private project this tool was extracted from, is
