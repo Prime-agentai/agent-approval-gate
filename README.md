@@ -94,6 +94,22 @@ empty or missing allowlist blocks `git push` from every tool call,
 unconditionally — fail closed, not fail open. Add a line only when you mean
 it.
 
+**One consequence that will look like a bug the first time it happens:** the
+allowlist is matched against the *command string*, and `git push origin main`
+does not contain a destination. There is nothing in it for an allowlist entry
+to match, so it is blocked even when that remote is on your list. This is
+correct — a guard that cannot see where a push is going must not wave it
+through — but it means an approved push has to name its destination:
+
+```bash
+git push https://github.com/you/your-repo.git main    # matches the allowlist
+git push origin main                                  # blocked: no destination in the string
+```
+
+Don't put a token in that URL to make credentials work. A literal secret in a
+command string trips the `SECRET_IN_COMMAND` rule, also correctly; use a
+credential helper or an environment-backed one instead.
+
 No dependencies beyond the Python 3 standard library.
 
 ## Verify it's actually live
