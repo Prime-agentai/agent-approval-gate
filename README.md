@@ -1,13 +1,31 @@
 # agent-approval-gate
 
-Mechanical enforcement of "don't spend money, create accounts, or move funds
-without human approval" for an autonomous LLM agent — plus a measured spend
-ceiling and runaway-loop detector, the approval queue that turns a block into
-a ticket, and a single-chokepoint state writer that protects the fields a
-human should own.
+A sandbox contains what an agent does to the host: files deleted, processes
+spawned, machines reached. It does nothing about an agent that spends money,
+opens an account, or moves funds — those calls go out over a permitted
+network path with valid credentials, and at the syscall layer they are
+indistinguishable from the work you asked for. A container runs them
+happily.
 
-Four small, dependency-free Python scripts. No framework, no daemon, no
+This is a second layer for that specific class of harm. Four small,
+dependency-free Python scripts: a `PreToolUse` hook that blocks the call
+before it executes, a spend ceiling and runaway-loop detector, an approval
+queue that turns a block into a reviewable ticket, and a verifier that proves
+the hooks are registered and actually firing. No framework, no daemon, no
 external service.
+
+**Run a sandbox as well.** The two cover different failures:
+
+| Harm | Contained by a sandbox | Covered here |
+|---|---|---|
+| `rm -rf`, dropping the production database, trashing the host | Yes — use a sandbox | No |
+| Reaching machines, ports, or files it shouldn't | Yes — use a sandbox | No |
+| Spending money over an allowed path with valid credentials | No | Yes |
+| Creating accounts, signing up for services, moving funds | No | Yes |
+| A retry loop quietly billing you for hours | No | Yes |
+
+The top two rows are why the README says "not a sandbox" and means it. The
+bottom three are why a sandbox alone was never going to be enough.
 
 ## The problem this solves
 
@@ -35,6 +53,28 @@ registering, moving funds, deploying a contract) rather than at keywords. A
 block is also not a dead end: it's logged, and the agent is told to file a
 request with `approve.py` so a human sees a queued ticket instead of the
 agent silently retrying or working around it.
+
+### About approval fatigue
+
+The standing objection to anything with "approval" in the name is that
+humans rubber-stamp prompts they see too often, so the gate becomes
+theatre. That objection is correct about high-frequency, blocking permission
+dialogs, and this is built to avoid being one:
+
+- **It fires rarely.** It does not gate every bash call. The default rule
+  pack matches a short list of irreversible acts — spend, account creation,
+  fund movement, secrets passed on a command line, pushes to unapproved
+  remotes. Across 47 sessions of the agent this was written for, it fired a
+  handful of times. A prompt that fires twice a week is a different object
+  from one that fires twice a minute.
+- **It doesn't block on you.** There is no modal, no countdown, and no
+  "approve now or stop working." The blocked call is written to
+  `approvals/queue.jsonl` and the agent is instructed to continue on
+  unblocked work. You answer the queue when you get to it.
+
+If your rule pack is firing often enough to be annoying, that is a signal
+the rules are too broad for your agent, not that you should click faster.
+Narrow them — the config is a JSON file.
 
 ## What's in this repo
 
@@ -545,9 +585,10 @@ relying on it.
 ## What this is not
 
 - **Not a sandbox.** It inspects the tool call before it runs; it does not
-  contain or reverse anything that already executed. Pair it with running
-  the agent under least-privilege credentials (a scoped API token, a
-  restricted cloud account) — the gate is a second layer, not the only one.
+  contain or reverse anything that already executed. Nothing here will stop
+  an agent deleting your files or reaching a host it shouldn't — that is a
+  sandbox's job, and the table at the top of this README is the split. Run
+  both, under least-privilege credentials.
 - **Not exhaustive.** Regex-based content matching on tool arguments will
   have both false positives (over-blocking legitimate work — its own
   documented failure mode) and false negatives (a sufficiently adversarial
