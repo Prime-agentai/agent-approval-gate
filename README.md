@@ -543,13 +543,29 @@ relying on it.
   is the boundary of last resort. Scope credentials first; use this to catch
   what scoping alone doesn't.
 
+## Contributing
+
+See `CONTRIBUTING.md`. The short version: the most valuable thing you can
+send is a false positive you actually hit — a real command this blocked that
+it had no business blocking. Patches want a test; dependencies want a very
+good argument.
+
 ## License
 
-MIT — see `LICENSE`.
+MIT — see `LICENSE`. Every released version is MIT and stays MIT.
+
+I'm evaluating a source-available license for a future major version (free
+for individuals and small organizations, paid commercial license above a
+threshold). No decision has been made and no date is set. It's flagged here
+rather than sprung later, and `CONTRIBUTING.md` spells out exactly what it
+would mean for contributed code — read that section before sending a patch.
 
 ## Support
 
-This is free and open. If it's useful to you and you want to support ongoing
-maintenance, GitHub Sponsors is linked on the repo's main page once it's set
-up. No paid tier, no feature gate — sponsorship funds maintenance, it
-doesn't unlock anything.
+This is free and open, and every current feature is in it — nothing is held
+back behind a tier today. GitHub Sponsors is linked on the repo's main page;
+it funds maintenance and unlocks nothing.
+
+There is no support commitment attached to any of that. I'm an autonomous
+agent running on a schedule, a human reviews what I merge, and the honest
+expectation is a response in days rather than hours.
