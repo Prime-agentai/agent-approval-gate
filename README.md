@@ -27,6 +27,45 @@ external service.
 The top two rows are why the README says "not a sandbox" and means it. The
 bottom three are why a sandbox alone was never going to be enough.
 
+## See it work, in 60 seconds
+
+Before you read another word or touch a project you care about:
+
+```bash
+git clone https://github.com/Prime-agentai/agent-approval-gate.git
+cd agent-approval-gate
+python3 demo.py
+```
+
+`demo.py` builds a throwaway agent project in a temp directory, installs the
+gate into it with the real `install.py`, and fires real tool-call payloads
+through the registered hook:
+
+```
+      The agent tries to...                                 The gate  rule
+      ----------------------------------------------------  --------  --------------------
+      charges a card to 'test the billing integration'      BLOCKED   PAYMENT_API_WRITE
+      signs itself up for a SaaS account                    BLOCKED   ACCOUNT_SIGNUP_FLOW
+      moves funds out of a wallet                           BLOCKED   FUND_MOVEMENT
+      installs a dependency nobody reviewed                 BLOCKED   PACKAGE_INSTALL
+      pushes your code to a remote that is not yours        BLOCKED   GIT_PUSH_UNAPPROVED
+      rewrites the state file a human owns                  BLOCKED   PROTECTED_FILE
+      reads the pricing API -- research, not a charge       allowed
+      runs the test suite                                   allowed
+```
+
+Then it shows the blocked call's audit-log entry and the approval ticket a
+human actually reads, and deletes the temp directory. Nothing outside that
+directory is written, no network call is made, and **none of those commands
+are ever executed** — they are handed to the hook as JSON on stdin, which is
+the entire point: the gate decides before the command runs.
+
+Full captured run: [`examples/demo-transcript.txt`](examples/demo-transcript.txt).
+No dependencies beyond the Python 3 standard library, so the three lines
+above are the whole prerequisite list. Exit status is 0 only if every probe
+decided as documented, so `demo.py` is also a smoke test of the installer and
+both guards together on a clean machine.
+
 ## The problem this solves
 
 If you tell an agent in its system prompt "never spend money without asking
@@ -80,6 +119,7 @@ Narrow them — the config is a JSON file.
 
 | File | Purpose |
 |---|---|
+| `demo.py` | Zero-argument demo and smoke test: builds a throwaway project, installs the gate into it for real, fires payloads through the hook and shows what blocked. Deletes the temp project unless you pass `--keep`. |
 | `install.py` | One-command setup: copies the scripts, writes a config, merges the hook into your `.claude/settings.json` without clobbering existing hooks. Idempotent; `--dry-run` supported. |
 | `verify.py` | Fires real probe payloads through **both** hooks *as your harness has them registered* and reports what actually blocked. The answer to "is this thing even running?" Budget probes run against a throwaway state directory so they can never poison your real spend rollup. |
 | `gate_guard.py` | The `PreToolUse` hook. Reads the pending tool call on stdin, exits 0 (allow) or 2 (block). |
@@ -91,10 +131,12 @@ Narrow them — the config is a JSON file.
 | `examples/claude-code-settings.json` | How to register `gate_guard.py` as a Claude Code `PreToolUse` hook. |
 | `examples/approved-remotes.example.txt` | Format for the git-push allowlist. |
 | `examples/STATE.example.json` | Minimal shape `state.py` expects. |
+| `examples/demo-transcript.txt` | A captured `demo.py` run, for reading without running anything. |
 | `tests/test_gate_guard.py` | A small sanity suite for the default rule pack (13 cases). Not a security audit — see "Testing" below. |
 | `tests/test_install.py` | 27 cases pinning down the settings merge: existing hooks survive, re-running doesn't duplicate, both guards register side by side, malformed settings are refused rather than overwritten. |
 | `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
 | `tests/test_verify.py` | 31 cases. Five deliberately break `budget_guard.py` and assert `verify.py` catches it — a verifier that passes a broken guard is worse than none. |
+| `tests/test_demo.py` | 32 cases running `demo.py` end to end: cleanup, cwd isolation, `--keep`/`--quiet`, and that every table row matches the verdict claimed. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -104,6 +146,7 @@ Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
 ```bash
 git clone https://github.com/Prime-agentai/agent-approval-gate.git
 cd agent-approval-gate
+python3 demo.py                                            # optional: watch it work first
 python3 install.py --target /path/to/your-agent-project
 python3 verify.py  --target /path/to/your-agent-project
 ```
@@ -536,6 +579,7 @@ python3 tests/test_gate_guard.py    # 13 cases, rule-pack behavior
 python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
 python3 tests/test_verify.py        # 31 cases, incl. mutation tests on verify.py
+python3 tests/test_demo.py          # 32 cases, front-door demo end to end
 ```
 
 `tests/test_budget_guard.py` concentrates on the cases where a plausible
@@ -561,6 +605,15 @@ unreadable transcript fail closed — and assert that the run exits non-zero
 with the matching probe failing. A sixth asserts the isolation guarantee:
 after a full probe run booking thousands of dollars of synthetic spend, the
 project's own `.budget-guard/` still contains no rollup and no loop state.
+
+`tests/test_demo.py` runs `demo.py` itself, end to end, three times. It
+checks the promises a stranger relies on before they trust anything else
+here: that the temp project is really deleted, that running it from a
+directory you own leaves that directory byte-identical, that every row in the
+results table carries the verdict the code claims, and that a probe deciding
+unexpectedly makes the run exit non-zero rather than print a reassuring
+table. Slower than testing functions in isolation, deliberately — a demo that
+passes unit tests and fails when invoked is the exact failure it guards.
 
 For end-to-end confidence in an actual install, `verify.py` is the tool —
 these suites test the pieces, `verify.py` tests the wiring.

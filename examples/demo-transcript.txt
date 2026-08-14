@@ -1,0 +1,106 @@
+Captured output of `python3 demo.py`, run on a clean checkout.
+
+This is a real run, not a mockup: every line below was produced by
+install.py, gate_guard.py and approve.py doing the actual work, in a
+throwaway temp project that was deleted when the run finished. Reproduce it
+yourself in about ten seconds -- no arguments, no network, nothing written
+outside the temp directory:
+
+    git clone https://github.com/Prime-agentai/agent-approval-gate.git
+    cd agent-approval-gate
+    python3 demo.py
+
+The temp path and the timestamps will differ. Nothing else should. If a probe
+in your run decides differently from the one below, that is a real finding --
+please open an issue.
+
+--------------------------------------------------------------------------
+
+agent-approval-gate -- 60-second demo
+
+Nothing outside the temp directory below is written, and none of the
+commands below are ever executed -- they are handed to the hook as JSON,
+which is the point: the gate decides before the command runs.
+
+[1/4] A throwaway agent project
+      /tmp/aag-demo-mxg0iobj
+
+[2/4] Installing the gate into it, with the real installer
+      agent-approval-gate -> /tmp/aag-demo-mxg0iobj
+        [create]  bin/gate_guard.py
+        [create]  bin/approve.py
+        [create]  bin/state.py
+        [create]  bin/budget_guard.py
+        [create]  gate-guard.config.json   -- state_path -> STATE.json
+        [create]  budget-guard.config.json   -- ceilings: $10.0/session, $40.0/day (list-price est.)
+        [create]  approved-remotes.txt   -- empty = all pushes blocked
+        [create]  .budget-guard   -- log directory
+        [create]  approvals   -- log directory
+        [create]  ledger   -- log directory
+        [create]  .claude/settings.json   -- gate_guard.py: new settings file with the hook registered
+        [update]  .claude/settings.json   -- budget_guard.py: hook appended, your other hooks preserved
+      Installed. Next:
+        1. Read gate-guard.config.json and adjust protected_paths for your project.
+           Spend ceilings are live in budget-guard.config.json: $10.0 per session, $40.0 per day. These are LIST-PRICE ESTIMATES, not your bill -- set them to numbers that mean something to you, or null to disable.
+        2. python3 ../aag/verify.py --target ../aag-demo-mxg0iobj
+           -- fires real probes through the hook and shows what blocks.
+        Then restart your harness session so it reloads settings.json.
+
+[3/4] Firing real tool calls through the registered hook
+
+      The agent tries to...                                 The gate  rule
+      ----------------------------------------------------  --------  --------------------
+      charges a card to 'test the billing integration'      BLOCKED   PAYMENT_API_WRITE
+      signs itself up for a SaaS account                    BLOCKED   ACCOUNT_SIGNUP_FLOW
+      moves funds out of a wallet                           BLOCKED   FUND_MOVEMENT
+      installs a dependency nobody reviewed                 BLOCKED   PACKAGE_INSTALL
+      pushes your code to a remote that is not yours        BLOCKED   GIT_PUSH_UNAPPROVED
+      rewrites the state file a human owns                  BLOCKED   PROTECTED_FILE
+      reads the pricing API -- research, not a charge       allowed
+      runs the test suite                                   allowed
+
+      A blocked call exits non-zero and the harness never runs it. The
+      agent is told why, and told to file a request rather than retry:
+
+      | BLOCKED BY APPROVAL GATE [PAYMENT_API_WRITE]
+      | Writing to a payment processor or exchange API requires approval. Reading (GET) is fine; POST/PUT is not.
+      | This block is logged to approvals/blocked.jsonl. Do not retry it, do not work around it, and do not attempt to disable this hook. If you genuinely need it, file a request with approve.py request so a human sees it, then continue with unblocked work.
+
+      Every block is evidence. approvals/blocked.jsonl, 7 entries:
+      {
+        "ts": "2026-08-14T04:02:58.072362+00:00",
+        "rule": "PAYMENT_API_WRITE",
+        "tool": "Bash",
+        "attempted": "curl -X POST https://api.stripe.com/v1/charges -d amount=4900 -d currency=usd  # aag-demo",
+        "trust_tier_at_block": 0
+      }
+
+[4/4] What the human actually sees
+      $ approve.py request --tier SPEND --ask '...' --why '...'
+      queued APPROVAL #0001 (SPEND)
+      Now continue with work that is NOT blocked. Never idle on an approval.
+
+      approvals/queue.jsonl now holds one reviewable ticket:
+      {
+        "id": 1,
+        "ts": "2026-08-14T04:02:58.811752+00:00",
+        "tier": "SPEND",
+        "ask": "Charge $49 to the test card to exercise the billing path",
+        "why": "The integration test needs one real charge to assert against",
+        "cost": "$49",
+        "reversible": "yes -- refundable within 24h",
+        "blocked_if_denied": "Billing tests stay mocked; nothing else stalls",
+        "handoff": "n/a",
+        "status": "pending"
+      }
+
+      A human answers it -- append-only, nothing edited in place:
+      $ approve.py decide 1 deny 'Use the sandbox card, not a live charge'
+      #0001 deny
+
+Every probe decided as expected. Nothing here was mocked: that was
+install.py, gate_guard.py and approve.py doing the real thing.
+
+Install it into your own project:
+  python3 install.py --target /path/to/your-agent-project
+  python3 verify.py  --target /path/to/your-agent-project
