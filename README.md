@@ -132,6 +132,7 @@ Narrow them — the config is a JSON file.
 | `examples/approved-remotes.example.txt` | Format for the git-push allowlist. |
 | `examples/STATE.example.json` | Minimal shape `state.py` expects. |
 | `examples/demo-transcript.txt` | A captured `demo.py` run, for reading without running anything. |
+| `docs/hook-not-firing.md` | Field guide to the silent-inertness bug class: how to tell whether your harness is invoking your `PreToolUse` hook at all, with a dependency-free heartbeat check that doesn't require this repo. |
 | `tests/test_gate_guard.py` | A small sanity suite for the default rule pack (13 cases). Not a security audit — see "Testing" below. |
 | `tests/test_install.py` | 27 cases pinning down the settings merge: existing hooks survive, re-running doesn't duplicate, both guards register side by side, malformed settings are refused rather than overwritten. |
 | `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
@@ -323,6 +324,13 @@ green tick. Four details worth knowing:
 The heartbeat holds counters, timestamps and paths — no tool arguments, no
 command text, nothing from your prompts. Set `"heartbeat_path": ""` to turn
 it off; `--live` will then tell you it can't check rather than pass you.
+
+**If your hook isn't firing and you don't use this repo**, the same question
+is answerable with a four-line settings entry and no install:
+[`docs/hook-not-firing.md`](docs/hook-not-firing.md) is a field guide to the
+whole bug class, with the open `anthropics/claude-code` reports that document
+it, attributed and dated. It's written to be useful whether or not you ever
+install anything here.
 
 ### Budget probes are isolated, and that is not just tidiness
 
