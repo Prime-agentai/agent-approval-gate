@@ -86,6 +86,11 @@ DEFAULT_CONFIG = {
     "approved_remotes_file": "approved-remotes.txt",
     # Where blocked attempts are logged, relative to the project root.
     "blocked_log": "approvals/blocked.jsonl",
+    # Where the liveness heartbeat is written, relative to the project root.
+    # Rewritten on EVERY invocation, allow or block, so `verify.py --live` can
+    # tell "the hook is registered" apart from "the hook actually ran". Set to
+    # "" to disable. See record_heartbeat() for why this exists.
+    "heartbeat_path": "approvals/heartbeat.json",
     # Files/paths the agent may never modify, via any tool. Keep this list
     # short and specific: your constitution, your state file, this hook
     # itself, your harness's hook-registration file, and your remotes
@@ -334,6 +339,103 @@ def check_git_push(text, config):
     )
 
 
+def record_heartbeat(config, tool_name, decision, rule_id):
+    """Leave proof that the harness actually invoked this hook.
+
+    The failure mode this exists for: a PreToolUse hook that is registered in
+    settings.json but silently never runs. Nothing in the transcript says so --
+    the agent's tool calls just succeed, and a guard you believe is enforcing
+    is inert. Wiring is not firing, and until now nothing here could tell the
+    two apart from the outside.
+
+    So every invocation rewrites one small file: when it last ran, how many
+    times, which copy of this script ran, and which config it loaded. That last
+    pair matters more than it looks -- a harness running a stale copy from
+    another directory, or loading a config you have since edited, presents
+    exactly as "my rule change did nothing".
+
+    Probe invocations (verify.py driving the hook directly, marked with
+    GATE_GUARD_PROBE) are counted separately, because a probe proves the script
+    works and proves nothing at all about the harness.
+
+    Caveats, stated rather than hidden:
+      * Counters are best-effort read-modify-write. Under parallel tool calls
+        an increment can be lost, so `invocations` is a lower bound, never an
+        overcount.
+      * Every failure here is swallowed. A guard that crashes on bookkeeping
+        would turn a block into an allow, which is the one outcome worse than
+        having no heartbeat at all.
+    """
+    rel = config.get("heartbeat_path") or ""
+    if not rel:
+        return
+    path = os.path.join(config["_project_root"], rel)
+    now = datetime.now(timezone.utc).isoformat()
+    probe = bool(os.environ.get("GATE_GUARD_PROBE"))
+    try:
+        prior = {}
+        try:
+            with open(path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                prior = loaded
+        except (FileNotFoundError, ValueError):
+            pass
+
+        def count(field):
+            value = prior.get(field, 0)
+            return value + 1 if isinstance(value, int) else 1
+
+        guard_path = os.path.abspath(__file__)
+        entry = {
+            "schema": 1,
+            "first_invocation": prior.get("first_invocation") or now,
+            "invocations": prior.get("invocations", 0) if probe else count("invocations"),
+            "probe_invocations": count("probe_invocations") if probe
+                else prior.get("probe_invocations", 0),
+            "blocks": count("blocks") if decision == "block"
+                else prior.get("blocks", 0),
+            "guard_path": guard_path,
+            "config_path": find_config_path(),
+            "python": sys.executable,
+        }
+        # Whether the running copy of the guard is the one on disk now: if the
+        # file has been edited since it last ran, the harness is still holding
+        # the old behaviour and the session needs a restart.
+        try:
+            entry["guard_mtime"] = datetime.fromtimestamp(
+                os.path.getmtime(guard_path), timezone.utc).isoformat()
+        except OSError:
+            entry["guard_mtime"] = None
+
+        # The last real (non-probe) invocation is the liveness signal, so a
+        # verify.py run must never refresh it.
+        last = {
+            "last_invocation": now,
+            "last_tool": tool_name,
+            "last_decision": decision,
+            "last_rule": rule_id,
+            "last_pid": os.getpid(),
+        }
+        if probe:
+            entry.update({k: prior.get(k) for k in last})
+            entry["last_probe_invocation"] = now
+        else:
+            entry.update(last)
+            entry["last_probe_invocation"] = prior.get("last_probe_invocation")
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # Write-then-rename: a reader mid-write sees the old file, never a
+        # truncated one. Unique temp name so concurrent hooks don't collide.
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(entry, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        pass  # Never let bookkeeping failure change a decision.
+
+
 def log_block(rule_id, tool_name, text, tier, config):
     """Record the block as evidence. The agent turns it into a formal request
     with approve.py; this log is the audit trail a human can review."""
@@ -392,6 +494,8 @@ def main():
 
     config = load_config()
     hit, tool_name, text, tier = evaluate(payload, config)
+    record_heartbeat(config, tool_name, "block" if hit else "allow",
+                     hit[0] if hit else None)
 
     if not hit:
         sys.exit(0)

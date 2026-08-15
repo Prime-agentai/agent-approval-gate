@@ -121,7 +121,7 @@ Narrow them — the config is a JSON file.
 |---|---|
 | `demo.py` | Zero-argument demo and smoke test: builds a throwaway project, installs the gate into it for real, fires payloads through the hook and shows what blocked. Deletes the temp project unless you pass `--keep`. |
 | `install.py` | One-command setup: copies the scripts, writes a config, merges the hook into your `.claude/settings.json` without clobbering existing hooks. Idempotent; `--dry-run` supported. |
-| `verify.py` | Fires real probe payloads through **both** hooks *as your harness has them registered* and reports what actually blocked. The answer to "is this thing even running?" Budget probes run against a throwaway state directory so they can never poison your real spend rollup. |
+| `verify.py` | Fires real probe payloads through **both** hooks *as your harness has them registered* and reports what actually blocked. The answer to "is this thing even running?" `--live` answers the harder half — whether your *harness* has actually invoked the hook, which no probe can prove. Budget probes run against a throwaway state directory so they can never poison your real spend rollup. |
 | `gate_guard.py` | The `PreToolUse` hook. Reads the pending tool call on stdin, exits 0 (allow) or 2 (block). |
 | `budget_guard.py` | A second `PreToolUse` hook: blocks when the session's measured token spend crosses a ceiling, or when the agent starts repeating itself. Also runs standalone as a cost reporter. |
 | `approve.py` | The approval queue CLI: file a request, list what's pending, record a human's decision. |
@@ -265,6 +265,64 @@ passes; `--skip-budget` omits it entirely. `verify.py` exits non-zero if
 anything failed, so it drops into CI.
 
 Re-run it after any change to `settings.json`, either config, or your rules.
+
+### `--live`: is your harness actually calling the hook?
+
+Everything above proves the *script* works. It cannot prove your *harness*
+runs it — `verify.py` invokes the hook command itself, so a run that passes
+every probe is still consistent with a harness that has never called the hook
+once. Registered is not the same as running, and that gap is where hooks go
+to die quietly:
+
+- a hook added mid-session, with settings only read at session start
+- a user-level or plugin-declared `settings.json` shadowing the project one
+- a stale copy of `gate_guard.py` in another directory doing the enforcing,
+  so your edits to *this* copy change nothing
+- a config you edited that the guard never loads
+
+Every one of those presents identically from inside a session: no error, no
+output, tool calls that simply succeed.
+
+So `gate_guard.py` now writes a heartbeat on **every** invocation — allow or
+block — to `approvals/heartbeat.json`, and `verify.py --live` reads it:
+
+```
+$ python3 verify.py --live
+
+LIVENESS -- has the harness actually called the hook?
+  PASS  hook registered in .claude/settings.json        yes
+  PASS  last harness invocation                         3 min ago
+  PASS  invocations recorded                            412 from the harness, 15 from verify.py
+  PASS  blocks recorded                                 7
+  PASS  last tool call seen                             Bash -> block
+  PASS  the copy that ran is the one you wired          /p/bin/gate_guard.py
+  PASS  the config it loaded is the one you edited      /p/gate-guard.config.json
+  PASS  guard unchanged since it last ran               yes
+
+The harness is calling the guard, and calling the copy you think it is.
+```
+
+If it has never run, you get a `FAIL` and an ordered checklist rather than a
+green tick. Four details worth knowing:
+
+- **`verify.py`'s own probes are counted separately** and never satisfy the
+  check. They run with `GATE_GUARD_PROBE=1` set, land in
+  `probe_invocations`, and leave `last_invocation` untouched — otherwise
+  running the liveness check would be what made it pass. A heartbeat showing
+  probes and nothing else says exactly that: *the script runs; the harness is
+  not calling it.*
+- **A stale heartbeat is a `WARN`, not a pass.** `--max-age` sets the window
+  (default 24 hours).
+- **`guard_mtime` catches the other half of the restart problem** — if you
+  edited the guard after it last ran, the live session is still enforcing the
+  old rules, and it says so.
+- **`invocations` is a lower bound.** The counter is a best-effort
+  read-modify-write, so parallel tool calls can lose an increment. It never
+  overcounts, and liveness doesn't depend on the exact number.
+
+The heartbeat holds counters, timestamps and paths — no tool arguments, no
+command text, nothing from your prompts. Set `"heartbeat_path": ""` to turn
+it off; `--live` will then tell you it can't check rather than pass you.
 
 ### Budget probes are isolated, and that is not just tidiness
 
@@ -557,6 +615,7 @@ All three scripts share one config file. See
 | `protected_paths` | `gate_guard.py` | Files no tool call may modify, ever |
 | `approved_remotes_file` | `gate_guard.py` | Allowlist for `git push` targets |
 | `blocked_log` | `gate_guard.py` | Where blocked attempts are logged |
+| `heartbeat_path` | `gate_guard.py` | Where the liveness heartbeat is written; `""` disables it |
 | `queue_path`, `decisions_path` | `approve.py` | The two JSONL files |
 | `approval_tiers` | `approve.py` | Allowed values for `--tier` |
 | `immutable_fields` | `state.py` | Top-level state fields the script refuses to write |
@@ -580,6 +639,7 @@ python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
 python3 tests/test_verify.py        # 31 cases, incl. mutation tests on verify.py
 python3 tests/test_demo.py          # 32 cases, front-door demo end to end
+python3 tests/test_heartbeat.py     # 19 cases, liveness heartbeat and --live
 ```
 
 `tests/test_budget_guard.py` concentrates on the cases where a plausible
@@ -605,6 +665,14 @@ unreadable transcript fail closed — and assert that the run exits non-zero
 with the matching probe failing. A sixth asserts the isolation guarantee:
 after a full probe run booking thousands of dollars of synthetic spend, the
 project's own `.budget-guard/` still contains no rollup and no loop state.
+
+`tests/test_heartbeat.py` protects the one property that makes `--live`
+worth having: that it reports `FAIL` on a hook which is registered and inert.
+Its cases cover nothing having run, only `verify.py`'s probes having run, a
+stale heartbeat, a harness executing a different copy of the guard than
+`settings.json` names, and a guard edited since it last ran. Two more assert
+that the bookkeeping can never change a decision — with the heartbeat pointed
+at an unwritable path, a block still blocks and an allow still allows.
 
 `tests/test_demo.py` runs `demo.py` itself, end to end, three times. It
 checks the promises a stranger relies on before they trust anything else

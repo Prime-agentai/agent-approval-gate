@@ -88,6 +88,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 # --- probe payload fragments (see the docstring's note on the splits) ---
 
@@ -190,6 +191,16 @@ def find_hook_command(target, marker="gate_guard.py"):
     return None, f"no PreToolUse hook referencing {marker} is registered"
 
 
+def wired_guard_path(command, target):
+    """The gate_guard.py the registered hook command actually executes,
+    absolute. Returns None if the command doesn't name one."""
+    m = re.search(r"(\S*gate[_-]guard\.py)", command)
+    if not m:
+        return None
+    guard = m.group(1).strip("\"'")
+    return guard if os.path.isabs(guard) else os.path.join(target, guard)
+
+
 def resolve_config(command, target):
     """Resolve the config exactly the way gate_guard.py will: the env var in
     the hook command first, then the project root."""
@@ -212,10 +223,7 @@ def check_wiring(target):
         return rows, None, None, None
     rows.append((PASS, "hook registered in .claude/settings.json", command))
 
-    m = re.search(r"(\S*gate[_-]guard\.py)", command)
-    guard = (m.group(1).strip("\"'") if m else "")
-    if not os.path.isabs(guard):
-        guard = os.path.join(target, guard)
+    guard = wired_guard_path(command, target) or ""
     if os.path.isfile(guard):
         rows.append((PASS, "hook script exists at the registered path", guard))
     else:
@@ -709,12 +717,199 @@ def run_budget_probes(command, config, target, workdir):
 
 
 def run_probe(command, payload, target):
+    # GATE_GUARD_PROBE tells the guard this invocation came from here, not from
+    # the harness, so it is counted separately in the heartbeat. Without it,
+    # running this script would itself satisfy `--live` and the liveness check
+    # would only ever confirm its own probes.
+    env = dict(os.environ, GATE_GUARD_PROBE="1")
     proc = subprocess.run(
         ["sh", "-c", command],
         input=json.dumps(payload),
-        capture_output=True, text=True, cwd=target, timeout=60,
+        capture_output=True, text=True, cwd=target, timeout=60, env=env,
     )
     return proc.returncode, proc.stderr
+
+
+def heartbeat_path(target, command, config):
+    """Resolve the heartbeat file the way gate_guard.py will write it: relative
+    to the directory holding the config it loads, falling back to the project
+    root when no config file exists."""
+    rel = (config or {}).get("heartbeat_path", "approvals/heartbeat.json")
+    if not rel:
+        return None
+    config_path, _ = resolve_config(command, target)
+    root = os.path.dirname(config_path) if os.path.isfile(config_path) else target
+    return os.path.join(root, rel)
+
+
+def age_phrase(seconds):
+    if seconds < 90:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min ago"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f} hours ago"
+    return f"{seconds / 86400:.1f} days ago"
+
+
+NEVER_RAN = """
+  The hook is registered but there is no evidence it has ever run.
+
+  That is the failure this check exists for: a registered hook that never
+  fires looks identical, from inside a session, to a hook that fires and
+  allows everything. Work through these in order:
+
+    1. Restart the harness session. settings.json is read at session start;
+       a hook added mid-session is not live until you do.
+    2. Confirm the settings file the harness actually reads is the one you
+       edited -- project .claude/settings.json, not a user-level or
+       plugin-declared copy elsewhere.
+    3. Run the registered command by hand from the project root:
+         echo '{{"tool_name":"Bash","tool_input":{{"command":"ls"}}}}' \\
+           | {command}
+       If that writes the heartbeat but the harness does not, the guard is
+       fine and the wiring is not.
+    4. Make one ordinary tool call in the harness, then re-run this check.
+"""
+
+
+def check_live(target, max_age_hours):
+    """Report whether the harness -- not this script -- has actually invoked
+    the guard, and whether the copy it invoked is the one on disk now."""
+    print(f"agent-approval-gate: liveness check for {target}\n")
+    print("LIVENESS -- has the harness actually called the hook?")
+    rows = []
+    ok = True
+
+    command, err = find_hook_command(target)
+    if not command:
+        print(f"  {FAIL:<4}  hook registered in .claude/settings.json    {err}")
+        print("\n  Nothing to check liveness for until the hook is registered. "
+              "Run install.py first.")
+        return 1
+    rows.append((PASS, "hook registered in .claude/settings.json", "yes"))
+
+    config_path, _ = resolve_config(command, target)
+    config = {}
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except ValueError as e:
+            rows.append((WARN, "config parses", f"{config_path}: {e}"))
+
+    hb_path = heartbeat_path(target, command, config)
+    if not hb_path:
+        for row in rows:
+            print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
+        print("\n  heartbeat_path is disabled in your config, so liveness "
+              "cannot be checked. Set it to a path to enable this.")
+        return 1
+
+    try:
+        with open(hb_path) as f:
+            hb = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        rows.append((FAIL, "heartbeat written by the harness",
+                     f"{hb_path} absent or unreadable"))
+        for row in rows:
+            print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
+        print(NEVER_RAN.format(command=command))
+        return 1
+
+    invocations = hb.get("invocations") or 0
+    probes = hb.get("probe_invocations") or 0
+    last = hb.get("last_invocation")
+
+    if not invocations or not last:
+        detail = f"{probes} probe invocation(s) only" if probes else "none recorded"
+        rows.append((FAIL, "heartbeat written by the harness", detail))
+        for row in rows:
+            print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
+        print(NEVER_RAN.format(command=command))
+        if probes:
+            print("  Note: the only invocations on record came from verify.py "
+                  "itself. The script runs; the harness is not calling it.")
+        return 1
+
+    try:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(last)).total_seconds()
+    except ValueError:
+        age = None
+
+    if age is None:
+        rows.append((WARN, "last harness invocation", f"unparseable: {last!r}"))
+        ok = False
+    elif age > max_age_hours * 3600:
+        rows.append((WARN, "last harness invocation",
+                     f"{age_phrase(age)} -- older than {max_age_hours}h"))
+        ok = False
+    else:
+        rows.append((PASS, "last harness invocation", age_phrase(age)))
+
+    rows.append((PASS, "invocations recorded",
+                 f"{invocations} from the harness, {probes} from verify.py"))
+    rows.append((PASS, "blocks recorded", str(hb.get("blocks") or 0)))
+    if hb.get("last_tool"):
+        rows.append((PASS, "last tool call seen",
+                     f"{hb['last_tool']} -> {hb.get('last_decision', '?')}"))
+
+    # Which copy ran. A harness invoking a stale script in another directory,
+    # or loading a config other than the one you edited, presents exactly as
+    # "my rule change did nothing" -- so name the file, don't just pass it.
+    ran_guard = hb.get("guard_path")
+    wired_guard = wired_guard_path(command, target)
+    if ran_guard and wired_guard and \
+            os.path.realpath(ran_guard) != os.path.realpath(wired_guard):
+        rows.append((FAIL, "the copy that ran is the one you wired",
+                     f"ran {ran_guard}, settings.json points at {wired_guard}"))
+        ok = False
+    elif ran_guard:
+        rows.append((PASS, "the copy that ran is the one you wired", ran_guard))
+
+    ran_config = hb.get("config_path")
+    if os.path.isfile(config_path) and ran_config and \
+            os.path.realpath(ran_config) != os.path.realpath(config_path):
+        rows.append((FAIL, "the config it loaded is the one you edited",
+                     f"loaded {ran_config}, expected {config_path}"))
+        ok = False
+    elif ran_config:
+        rows.append((PASS, "the config it loaded is the one you edited",
+                     ran_config))
+    elif os.path.isfile(config_path):
+        rows.append((WARN, "the config it loaded is the one you edited",
+                     f"ran with built-in defaults, but {config_path} exists"))
+        ok = False
+
+    # Edited since it last ran => the live session is still enforcing the old
+    # rules. This is the single most common "why didn't my change take" cause.
+    if ran_guard and hb.get("guard_mtime") and os.path.isfile(ran_guard):
+        try:
+            on_disk = datetime.fromtimestamp(
+                os.path.getmtime(ran_guard), timezone.utc)
+            when_ran = datetime.fromisoformat(hb["guard_mtime"])
+            if on_disk > when_ran:
+                rows.append((WARN, "guard unchanged since it last ran",
+                             "edited since -- restart the session to load it"))
+                ok = False
+            else:
+                rows.append((PASS, "guard unchanged since it last ran", "yes"))
+        except (ValueError, OSError):
+            pass
+
+    for row in rows:
+        print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
+
+    if ok:
+        print("\nThe harness is calling the guard, and calling the copy you "
+              "think it is.\nThis says nothing about whether the rules are "
+              "correct -- run verify.py with no arguments for that.")
+        return 0
+    print("\nThe guard has run at some point, but something above does not "
+          "line up.\nA WARN here means what you edited and what is enforcing "
+          "may be different things.")
+    return 1
 
 
 def main():
@@ -724,8 +919,18 @@ def main():
                     help="Project root to check (default: current directory)")
     ap.add_argument("--skip-budget", action="store_true",
                     help="Check only the approval gate, not the budget guard")
+    ap.add_argument("--live", action="store_true",
+                    help="Check only whether the HARNESS has actually invoked "
+                         "the hook (registered is not the same as running), "
+                         "using the heartbeat gate_guard.py writes")
+    ap.add_argument("--max-age", type=float, default=24.0, metavar="HOURS",
+                    help="With --live, how old the last harness invocation may "
+                         "be before it is flagged stale (default: 24)")
     args = ap.parse_args()
     target = os.path.abspath(args.target)
+
+    if args.live:
+        return check_live(target, args.max_age)
 
     print(f"agent-approval-gate: verifying {target}\n")
     print("WIRING -- approval gate")

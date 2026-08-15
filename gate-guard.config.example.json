@@ -4,6 +4,7 @@
   "min_tier_for_tier_gated": 1,
   "approved_remotes_file": "approved-remotes.txt",
   "blocked_log": "approvals/blocked.jsonl",
+  "heartbeat_path": "approvals/heartbeat.json",
   "queue_path": "approvals/queue.jsonl",
   "decisions_path": "approvals/decisions.jsonl",
   "ledger_path": "ledger/ledger.jsonl",
