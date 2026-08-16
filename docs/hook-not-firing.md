@@ -159,18 +159,28 @@ leaves lines and your specific matcher doesn't, the problem is the matcher.
 
 ### 6. Subagents
 
-[#86405](https://github.com/anthropics/claude-code/issues/86405) (open,
-updated 2026-08-13) reports hooks not firing for subagent tool calls. If your
-threat model includes delegated work — and for an autonomous agent it should,
-because delegation that widens what's allowed is a hole in the whole design —
-test a subagent path explicitly rather than assuming the main session's
-behaviour carries over.
+[#86405](https://github.com/anthropics/claude-code/issues/86405) reports hooks
+not firing for subagent tool calls. If your threat model includes delegated
+work — and for an autonomous agent it should, because delegation that widens
+what's allowed is a hole in the whole design — test a subagent path explicitly
+rather than assuming the main session's behaviour carries over.
 
-That thread has sat at zero comments, and we think the reason is mechanical
-rather than a lack of interest: **nothing in a normal setup records the field
-that would settle it.** A hook that fires writes a line; a hook that doesn't
-writes nothing; and "nothing" looks the same as "no subagent ran." So the
-report can't be confirmed or refuted by the people best placed to do it.
+**Status, read live 2026-08-16:** open, labelled `needs-info`. A maintainer
+posted a non-reproduction on v2.1.233 (macOS) on 2026-08-15: hooks fired for
+every subagent tool call tried — inline, background, and a worktree-isolated
+custom agent — with `agent_id` and `agent_type` populated in each payload. The
+older report of the same class, [#43772](https://github.com/anthropics/claude-code/issues/43772)
+under `bypassPermissions`, was auto-closed as stale and locked without being
+triaged. So on a current build the balance of published evidence is that
+subagent hooks *do* fire; nothing has been reproduced against that.
+
+Which does not retire the question for you, because the deciding evidence is
+per-setup and **nothing in a normal setup records the field that settles it.**
+A hook that fires writes a line; a hook that doesn't writes nothing; and
+"nothing" looks the same as "no subagent ran." Note what the non-reproduction
+above actually consisted of: logging `agent_id` / `agent_type` per invocation
+and counting lines. That is the measurement below, run by someone with commit
+access. It is the right method whichever way your own answer comes out.
 
 Here is the measurement, and it needs no repository, no install and no
 agreement with anything else in this guide. Extend the Option A heartbeat line
@@ -195,10 +205,12 @@ Three outcomes, and they are genuinely different findings:
 | Line count grew, `agent` is `unattributed` | Hooks fire, but the payload doesn't name the caller. You are covered; you just can't attribute calls. |
 | Line count did not move | **The hook did not fire for the subagent's tool call.** This is the report in #86405, with a reproduction. |
 
-The third row is worth posting to that issue with your OS, version and the
-matcher you used. The second row is worth posting too — it means the payload
-carries no caller identity on your version, which is why nobody can produce
-evidence either way.
+The third row is the one #86405 is asking for by name — it carries the
+`needs-info` label precisely because no one has produced it. Post it with your
+OS, version, dispatch method and the matcher you used. The second row is worth
+posting too: it contradicts the maintainer's v2.1.233 run, in which every
+payload was labelled, and narrows the question to which versions or dispatch
+paths drop the marker.
 
 Whichever row you land in, act on it: until you have measured the first one,
 **do not delegate an action the main session isn't allowed to take.** An

@@ -332,7 +332,10 @@ it off; `--live` will then tell you it can't check rather than pass you.
 A guard that covers the main session and not its subagents is worse than no
 guard, because delegation then silently widens what the agent may do — and
 [#86405](https://github.com/anthropics/claude-code/issues/86405) reports
-exactly that, open and uncommented.
+exactly that. Read live on 2026-08-16: open, `needs-info`, with a maintainer's
+non-reproduction on v2.1.233 in which every subagent payload *was* labelled.
+Balance of published evidence says subagent hooks fire on a current build; what
+nobody has is per-setup evidence, because almost nothing records the field.
 
 So the heartbeat records **who** the harness said was calling, from
 `agent_type` / `agent_id` / `subagent_type` in the payload, plus the
