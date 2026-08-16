@@ -339,7 +339,115 @@ def check_git_push(text, config):
     )
 
 
-def record_heartbeat(config, tool_name, decision, rule_id):
+# Fields a harness may put in the hook payload to say WHO is making this call.
+# None of them are guaranteed to be there: a payload that omits every one is
+# indistinguishable from a main-session call, and that ambiguity is exactly
+# what caller_identity() is here to record rather than paper over.
+IDENTITY_KEYS = (
+    "agent_id", "agent_type", "subagent_type", "agent_name",
+    "permission_mode", "session_id", "hook_event_name",
+)
+
+# The subset whose presence means the caller is a subagent, not the main
+# session. Order matters: the first one present names the bucket.
+SUBAGENT_KEYS = ("agent_type", "subagent_type", "agent_name", "agent_id")
+
+# Cap on distinct callers tracked, so a harness that mints a fresh id per call
+# cannot grow this file without bound. Overflow lands in one "other" bucket.
+AGENT_BUCKET_LIMIT = 24
+
+
+def clean_token(value):
+    """Reduce a payload value to something safe to use as a JSON key: short,
+    printable, no separators that would make the bucket name ambiguous."""
+    if not isinstance(value, (str, int)):
+        return None
+    token = re.sub(r"[^A-Za-z0-9._:-]", "", str(value).strip())[:48]
+    return token or None
+
+
+def caller_identity(payload):
+    """Who made this call, to the extent the harness is willing to say.
+
+    Returns (bucket, present_keys, is_subagent).
+
+    The honest position, and the reason this returns "unattributed" rather
+    than "main": absence of an agent marker does not prove the main session
+    made the call. It is equally consistent with a harness that fires the hook
+    for subagents but does not label them. Only a POSITIVE marker proves
+    subagent coverage; its absence proves nothing, and the heartbeat says
+    "unproven" instead of guessing.
+    """
+    present = sorted(k for k in IDENTITY_KEYS
+                     if payload.get(k) not in (None, "", {}, []))
+    for key in SUBAGENT_KEYS:
+        token = clean_token(payload.get(key))
+        if token:
+            return f"{key}={token}", present, True
+    return "unattributed", present, False
+
+
+def merge_seen(prior, key, values, limit=32):
+    """Union of what previous invocations saw with what this one sees, sorted
+    and capped. Every field here is cumulative: the question being answered is
+    'has this EVER happened', not 'what happened last time'."""
+    before = prior.get(key)
+    before = [v for v in before if isinstance(v, str)] if isinstance(before, list) else []
+    return sorted(set(before) | set(values))[:limit]
+
+
+def record_identity(prior, payload, decision, now, probe):
+    """Track which callers the harness has actually routed through this hook.
+
+    This exists because "is the gate binding on subagent tool calls?" is
+    currently unanswerable from the outside -- upstream reports of hooks not
+    firing for subagent calls sit open with nobody able to produce evidence
+    either way, because nothing records the deciding field. A guard that runs
+    on every call is in the one position to record it, so it does.
+    """
+    bucket, present, is_subagent = caller_identity(payload)
+    agents = prior.get("agents")
+    agents = dict(agents) if isinstance(agents, dict) else {}
+
+    if not probe:  # A probe proves nothing about who the harness routes here.
+        if bucket not in agents and len(agents) >= AGENT_BUCKET_LIMIT:
+            bucket = "other"
+        row = agents.get(bucket)
+        row = dict(row) if isinstance(row, dict) else {}
+
+        def bump(field):
+            value = row.get(field)
+            return value + 1 if isinstance(value, int) else 1
+
+        agents[bucket] = {
+            "invocations": bump("invocations"),
+            "blocks": bump("blocks") if decision == "block"
+                else (row.get("blocks") if isinstance(row.get("blocks"), int) else 0),
+            "subagent": is_subagent or bool(row.get("subagent")),
+            "first_seen": row.get("first_seen") or now,
+            "last_seen": now,
+        }
+
+    proven = any(isinstance(v, dict) and v.get("subagent")
+                 for v in agents.values())
+    return {
+        # Every top-level key the harness has ever sent. If agent_type is not
+        # in here, the harness never offered one and no amount of reading this
+        # file will tell you whether a subagent was involved.
+        "payload_keys_seen": merge_seen(prior, "payload_keys_seen",
+                                        (k for k in payload if isinstance(k, str))),
+        "identity_keys_seen": merge_seen(prior, "identity_keys_seen", present),
+        # Recorded because a bypassPermissions call reaching this hook is the
+        # single most load-bearing thing a user can learn about their setup.
+        "permission_modes_seen": merge_seen(
+            prior, "permission_modes_seen",
+            [t for t in [clean_token(payload.get("permission_mode"))] if t], 8),
+        "agents": agents,
+        "subagent_coverage": "observed" if proven else "unproven",
+    }
+
+
+def record_heartbeat(config, payload, tool_name, decision, rule_id):
     """Leave proof that the harness actually invoked this hook.
 
     The failure mode this exists for: a PreToolUse hook that is registered in
@@ -357,6 +465,11 @@ def record_heartbeat(config, tool_name, decision, rule_id):
     Probe invocations (verify.py driving the hook directly, marked with
     GATE_GUARD_PROBE) are counted separately, because a probe proves the script
     works and proves nothing at all about the harness.
+
+    It also records WHICH caller the harness routed here -- main session or
+    subagent, and under which permission mode -- because "does the gate bind
+    on subagent tool calls?" is otherwise unanswerable from the outside. See
+    record_identity().
 
     Caveats, stated rather than hidden:
       * Counters are best-effort read-modify-write. Under parallel tool calls
@@ -398,6 +511,9 @@ def record_heartbeat(config, tool_name, decision, rule_id):
             "guard_path": guard_path,
             "config_path": find_config_path(),
             "python": sys.executable,
+            "identity": record_identity(
+                prior.get("identity") if isinstance(prior.get("identity"), dict)
+                else {}, payload, decision, now, probe),
         }
         # Whether the running copy of the guard is the one on disk now: if the
         # file has been edited since it last ran, the harness is still holding
@@ -494,7 +610,7 @@ def main():
 
     config = load_config()
     hit, tool_name, text, tier = evaluate(payload, config)
-    record_heartbeat(config, tool_name, "block" if hit else "allow",
+    record_heartbeat(config, payload, tool_name, "block" if hit else "allow",
                      hit[0] if hit else None)
 
     if not hit:

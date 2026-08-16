@@ -309,5 +309,147 @@ class CheckLiveTests(unittest.TestCase):
             self.assertIn("disabled", out)
 
 
+class SubagentCoverageTests(unittest.TestCase):
+    """Who the harness routes through the hook.
+
+    The claim these protect against is the tempting one: "no agent marker in
+    the payload, therefore the main session made the call, therefore subagents
+    are covered too." That inference is invalid -- a harness that fires the
+    hook for subagents without labelling them produces an identical payload,
+    and so does a harness that never fires it for subagents at all. Only a
+    positive marker proves coverage, so the tests below assert on BOTH sides:
+    that a marker is recorded when present, and that its absence is reported
+    as unproven rather than resolved either way.
+    """
+
+    def test_an_unmarked_call_is_unattributed_not_main_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            invoke(tmp, config_path, bash("ls"))
+            identity = read_heartbeat(tmp)["identity"]
+            self.assertEqual(identity["subagent_coverage"], "unproven")
+            self.assertEqual(list(identity["agents"]), ["unattributed"])
+            self.assertFalse(identity["agents"]["unattributed"]["subagent"])
+
+    def test_a_subagent_marker_is_recorded_and_proves_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            payload = dict(bash("ls"), agent_type="builder",
+                           session_id="s-1", permission_mode="default")
+            invoke(tmp, config_path, payload)
+            identity = read_heartbeat(tmp)["identity"]
+            self.assertEqual(identity["subagent_coverage"], "observed")
+            self.assertIn("agent_type=builder", identity["agents"])
+            self.assertTrue(identity["agents"]["agent_type=builder"]["subagent"])
+            self.assertIn("permission_mode", identity["identity_keys_seen"])
+            self.assertIn("agent_type", identity["payload_keys_seen"])
+
+    def test_coverage_survives_later_unmarked_calls(self):
+        # Cumulative by design: the question is "has this EVER happened", so a
+        # main-session call after a subagent call must not erase the evidence.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            invoke(tmp, config_path, dict(bash("ls"), agent_type="builder"))
+            for _ in range(2):
+                invoke(tmp, config_path, bash("ls"))
+            identity = read_heartbeat(tmp)["identity"]
+            self.assertEqual(identity["subagent_coverage"], "observed")
+            self.assertEqual(identity["agents"]["unattributed"]["invocations"], 2)
+            self.assertEqual(
+                identity["agents"]["agent_type=builder"]["invocations"], 1)
+
+    def test_per_agent_blocks_are_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            payload = dict(bash(_FUND_MOVE), agent_type="marketer")
+            self.assertEqual(invoke(tmp, config_path, payload), 2)
+            row = read_heartbeat(tmp)["identity"]["agents"]["agent_type=marketer"]
+            self.assertEqual(row["blocks"], 1)
+            self.assertEqual(row["invocations"], 1)
+
+    def test_probes_do_not_invent_a_caller(self):
+        # Same reasoning as probe isolation for the counters: verify.py can
+        # send any payload it likes, so a probe must never be able to make
+        # subagent coverage look proven.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            invoke(tmp, config_path, dict(bash("ls"), agent_type="builder"),
+                   probe=True)
+            identity = read_heartbeat(tmp)["identity"]
+            self.assertEqual(identity["agents"], {})
+            self.assertEqual(identity["subagent_coverage"], "unproven")
+
+    def test_permission_mode_is_accumulated(self):
+        # A bypassPermissions call reaching the hook is the single most
+        # load-bearing thing a user can learn about their own setup.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            invoke(tmp, config_path, dict(bash("ls"), permission_mode="default"))
+            invoke(tmp, config_path,
+                   dict(bash("ls"), permission_mode="bypassPermissions"))
+            modes = read_heartbeat(tmp)["identity"]["permission_modes_seen"]
+            self.assertEqual(modes, ["bypassPermissions", "default"])
+
+    def test_hostile_marker_cannot_corrupt_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            invoke(tmp, config_path,
+                   dict(bash("ls"), agent_type="a" * 400 + "\n/etc/passwd"))
+            identity = read_heartbeat(tmp)["identity"]
+            bucket = [k for k in identity["agents"] if k != "unattributed"][0]
+            self.assertLessEqual(len(bucket), len("agent_type=") + 48)
+            self.assertNotIn("/", bucket)
+
+    def test_agent_buckets_are_capped(self):
+        # A harness minting a fresh agent id per call must not be able to grow
+        # this file without bound.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            for i in range(30):
+                invoke(tmp, config_path, dict(bash("ls"), agent_id=f"a{i}"))
+            agents = read_heartbeat(tmp)["identity"]["agents"]
+            self.assertLessEqual(len(agents), 25)
+            self.assertIn("other", agents)
+            self.assertEqual(agents["other"]["invocations"], 6)
+
+    def test_live_reports_unproven_with_guidance_but_still_passes(self):
+        # A fresh install has never seen a subagent. That is not a wiring
+        # fault, and failing the check for it would train people to ignore the
+        # lines here that ARE wiring faults.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, identity={
+                "agents": {"unattributed": {"invocations": 4, "blocks": 1,
+                                            "subagent": False}},
+                "subagent_coverage": "unproven",
+            })
+            code, out = live(tmp)
+            self.assertEqual(code, 0)
+            self.assertIn("subagent coverage", out)
+            self.assertIn("unproven", out)
+            self.assertIn("do not delegate", out)
+
+    def test_live_names_an_observed_subagent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, identity={
+                "agents": {"agent_type=builder": {"invocations": 3, "blocks": 0,
+                                                  "subagent": True}},
+                "subagent_coverage": "observed",
+            })
+            code, out = live(tmp)
+            self.assertEqual(code, 0)
+            self.assertIn("observed: agent_type=builder (3 calls)", out)
+            self.assertNotIn("do not delegate", out)
+
+    def test_live_tolerates_a_heartbeat_written_before_this_feature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)  # no identity block at all
+            code, out = live(tmp)
+            self.assertEqual(code, 0)
+            self.assertIn("guard predates identity tracking", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -295,6 +295,8 @@ LIVENESS -- has the harness actually called the hook?
   PASS  last harness invocation                         3 min ago
   PASS  invocations recorded                            412 from the harness, 15 from verify.py
   PASS  blocks recorded                                 7
+  PASS  subagent coverage                               observed: agent_type=builder (23 calls)
+  PASS  permission modes seen                           default, plan
   PASS  last tool call seen                             Bash -> block
   PASS  the copy that ran is the one you wired          /p/bin/gate_guard.py
   PASS  the config it loaded is the one you edited      /p/gate-guard.config.json
@@ -324,6 +326,35 @@ green tick. Four details worth knowing:
 The heartbeat holds counters, timestamps and paths — no tool arguments, no
 command text, nothing from your prompts. Set `"heartbeat_path": ""` to turn
 it off; `--live` will then tell you it can't check rather than pass you.
+
+#### Subagent coverage: does the gate bind on delegated work?
+
+A guard that covers the main session and not its subagents is worse than no
+guard, because delegation then silently widens what the agent may do — and
+[#86405](https://github.com/anthropics/claude-code/issues/86405) reports
+exactly that, open and uncommented.
+
+So the heartbeat records **who** the harness said was calling, from
+`agent_type` / `agent_id` / `subagent_type` in the payload, plus the
+`permission_mode` it arrived under. `--live` reports one of two things:
+
+- `observed: agent_type=builder (23 calls)` — a subagent call demonstrably
+  reached the hook on your setup. Coverage proven, with a count.
+- `unproven — no call has named a subagent caller`, followed by the procedure
+  to resolve it: note the invocation count, have a subagent make one tool
+  call, re-run. If the count doesn't move, the hook is not firing for subagent
+  calls and you have a reproduction for #86405.
+
+It never reports "main session only." A payload carrying no agent marker is
+equally consistent with a harness that fires the hook for subagents without
+labelling them, and calling that "covered" would be inventing a result. This
+is the one line here that can be `WARN` on a perfectly healthy install; it
+does not fail the check.
+
+We built this because we needed it ourselves and found we couldn't answer the
+question: our own docs asserted the gate bound every subagent, and nothing we
+recorded could show it. `docs/hook-not-firing.md` has the same measurement in
+a four-line form that needs none of this code.
 
 **If your hook isn't firing and you don't use this repo**, the same question
 is answerable with a four-line settings entry and no install:

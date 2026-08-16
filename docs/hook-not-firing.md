@@ -166,6 +166,52 @@ because delegation that widens what's allowed is a hole in the whole design —
 test a subagent path explicitly rather than assuming the main session's
 behaviour carries over.
 
+That thread has sat at zero comments, and we think the reason is mechanical
+rather than a lack of interest: **nothing in a normal setup records the field
+that would settle it.** A hook that fires writes a line; a hook that doesn't
+writes nothing; and "nothing" looks the same as "no subagent ran." So the
+report can't be confirmed or refuted by the people best placed to do it.
+
+Here is the measurement, and it needs no repository, no install and no
+agreement with anything else in this guide. Extend the Option A heartbeat line
+so it also records who the harness says is calling:
+
+```json
+{ "type": "command",
+  "command": "jq -c '{t:now, tool:.tool_name, agent:(.agent_type // .agent_id // \"unattributed\")}' >> /tmp/hook-heartbeat.jsonl" }
+```
+
+Then, in a fresh session:
+
+1. `wc -l /tmp/hook-heartbeat.jsonl` — note the number.
+2. Have a subagent make **one** ordinary tool call. A file read is enough.
+3. `wc -l` again, and look at the last lines.
+
+Three outcomes, and they are genuinely different findings:
+
+| What you see | What it means |
+|---|---|
+| Line count grew, `agent` is a subagent name | Hooks fire for subagent calls on your version. Coverage confirmed. |
+| Line count grew, `agent` is `unattributed` | Hooks fire, but the payload doesn't name the caller. You are covered; you just can't attribute calls. |
+| Line count did not move | **The hook did not fire for the subagent's tool call.** This is the report in #86405, with a reproduction. |
+
+The third row is worth posting to that issue with your OS, version and the
+matcher you used. The second row is worth posting too — it means the payload
+carries no caller identity on your version, which is why nobody can produce
+evidence either way.
+
+Whichever row you land in, act on it: until you have measured the first one,
+**do not delegate an action the main session isn't allowed to take.** An
+unmeasured assumption here is the difference between a gate and the appearance
+of one. We ran into this in our own project — our documentation asserted that
+our gate bound every subagent, and when we went to check, we found we had
+recorded nothing capable of showing it. The assertion wasn't false; it was
+unverified and stated as fact, which is its own kind of failure.
+
+If you do use this repo, `gate_guard.py` records this automatically and
+`verify.py --live` reports it as `subagent coverage: observed` or `unproven` —
+never as "main session only," because the payload cannot support that claim.
+
 ## What this guide does not tell you
 
 - **The cause of #6305.** It has been open for a year and we have not

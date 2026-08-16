@@ -773,6 +773,59 @@ NEVER_RAN = """
 """
 
 
+SUBAGENT_UNPROVEN = """
+  Subagent coverage is UNPROVEN, which is not the same as broken.
+
+  No call recorded so far carried a marker naming a subagent as the caller.
+  Three different situations produce that identical result, and this file
+  cannot tell them apart on its own:
+
+    a. No subagent has made a tool call since the heartbeat started.
+    b. Subagent calls reach the hook, but your harness does not label who
+       made them -- the guard is binding, you just cannot attribute calls.
+    c. Subagent calls never reach the hook at all. This is the one that
+       matters: it means delegation silently widens what the agent may do.
+
+  To tell them apart, with the heartbeat at {invocations} invocations now:
+
+    1. Have a subagent make ONE ordinary tool call (a file read is enough).
+    2. Re-run this check.
+       * invocations went UP and a subagent bucket appeared  -> covered (a).
+       * invocations went UP, still no bucket                -> (b).
+       * invocations did NOT move                            -> (c): the
+         hook is not firing for subagent tool calls. Until that is fixed,
+         do not delegate an action the main session is not allowed to take.
+
+  Whatever you find, the number above is evidence rather than assumption --
+  which is more than the open upstream reports of this have to work with.
+"""
+
+
+def subagent_row(hb):
+    """Report whether any subagent call has ever been seen by the guard.
+
+    Deliberately never claims "main session only". A payload with no agent
+    marker is equally consistent with a harness that fires the hook for
+    subagents without labelling them, and reporting that absence as proof of
+    anything would be inventing a result.
+    """
+    identity = hb.get("identity")
+    if not isinstance(identity, dict):
+        return (WARN, "subagent coverage",
+                "not recorded -- guard predates identity tracking")
+    agents = identity.get("agents") if isinstance(identity.get("agents"), dict) else {}
+    seen = {k: v for k, v in agents.items()
+            if isinstance(v, dict) and v.get("subagent")}
+    if identity.get("subagent_coverage") == "observed" and seen:
+        names = ", ".join(
+            f"{k} ({v.get('invocations', 0)} call"
+            f"{'' if v.get('invocations') == 1 else 's'})"
+            for k, v in sorted(seen.items())[:3])
+        return (PASS, "subagent coverage", f"observed: {names}")
+    return (WARN, "subagent coverage",
+            "unproven -- no call has named a subagent caller")
+
+
 def check_live(target, max_age_hours):
     """Report whether the harness -- not this script -- has actually invoked
     the guard, and whether the copy it invoked is the one on disk now."""
@@ -851,6 +904,14 @@ def check_live(target, max_age_hours):
     rows.append((PASS, "invocations recorded",
                  f"{invocations} from the harness, {probes} from verify.py"))
     rows.append((PASS, "blocks recorded", str(hb.get("blocks") or 0)))
+    rows.append(subagent_row(hb))
+    # A call arriving under bypassPermissions and still reaching this hook is
+    # worth stating out loud: it is the setting under which hook coverage is
+    # most often assumed and least often checked.
+    modes = (hb.get("identity") or {}).get("permission_modes_seen") \
+        if isinstance(hb.get("identity"), dict) else None
+    if modes:
+        rows.append((PASS, "permission modes seen", ", ".join(modes)))
     if hb.get("last_tool"):
         rows.append((PASS, "last tool call seen",
                      f"{hb['last_tool']} -> {hb.get('last_decision', '?')}"))
@@ -900,6 +961,12 @@ def check_live(target, max_age_hours):
 
     for row in rows:
         print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
+
+    # Not folded into `ok`: an unproven subagent is the normal state of a fresh
+    # install, not a misconfiguration, and failing the check for it would train
+    # people to ignore the one line here that reports a real wiring fault.
+    if subagent_row(hb)[0] != PASS:
+        print(SUBAGENT_UNPROVEN.format(invocations=invocations))
 
     if ok:
         print("\nThe harness is calling the guard, and calling the copy you "
