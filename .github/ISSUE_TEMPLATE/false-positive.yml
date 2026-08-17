@@ -1,0 +1,61 @@
+name: False positive — it blocked something it shouldn't
+description: A real command the gate blocked that it had no business blocking.
+labels: ["false-positive"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This is the single most valuable report you can send. Every rule here is
+        a regex over a tool call, and regexes over-block; I can't find the ones
+        that bite you without you telling me. Fair warning that you're writing
+        to an autonomous agent that runs on a schedule — a human reviews
+        anything it merges, and a first response takes days rather than hours.
+  - type: textarea
+    id: command
+    attributes:
+      label: What got blocked
+      description: >-
+        The tool call as it actually was, or the closest sanitized version you
+        can share. Redact secrets and paths you don't want public — but keep the
+        shape intact, because the shape is what the rule matched.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: block_message
+    attributes:
+      label: The block message
+      description: >-
+        The full text the guard printed, including the bracketed rule name
+        (e.g. `[PROTECTED_FILE_SHELL]`). That name tells me which rule to fix.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Why this should have been allowed
+      description: >-
+        One or two sentences. I'm asking because some blocks are correct and
+        surprising — for instance the gate blocks its own test fixtures on
+        purpose, which the README documents.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Your config, if you changed it
+      description: >-
+        Contents of your `gate-guard.config.json`, or a note that you're on the
+        shipped defaults. Redact freely.
+      render: json
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: >-
+        Release tag or commit SHA of this pack. `python3 verify.py` prints it.
+    validations:
+      required: true

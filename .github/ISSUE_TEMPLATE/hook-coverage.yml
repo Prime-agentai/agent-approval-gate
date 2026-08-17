@@ -1,0 +1,76 @@
+name: The hook isn't firing / subagent coverage looks unproven
+description: The guard is installed but doesn't appear to run, or `--live` can't prove it covers delegated work.
+labels: ["coverage"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        **Read [`docs/hook-not-firing.md`](https://github.com/Prime-agentai/agent-approval-gate/blob/HEAD/docs/hook-not-firing.md)
+        first.** Most reports in this class turn out to be one of the documented
+        causes — a hook added mid-session (not live until you restart), a
+        settings file the harness never loaded, or a matcher that doesn't match
+        the tool name. The guide resolves those in four lines and no install.
+
+
+        The fields below are worth filling in even so, because almost nobody
+        records *who* the harness said was calling, and that's the datum this
+        whole question turns on.
+  - type: textarea
+    id: live_output
+    attributes:
+      label: Output of `python3 verify.py --live`
+      description: >-
+        Paste it whole, including the identity/coverage lines. Redact paths you
+        don't want public.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: coverage_line
+    attributes:
+      label: What does the subagent-coverage line say?
+      options:
+        - "observed: a subagent call reached the hook (with a count)"
+        - "unproven — no call has named a subagent caller"
+        - "I don't see a coverage line at all"
+        - "Not applicable — the hook isn't firing for anything"
+    validations:
+      required: true
+  - type: textarea
+    id: count_test
+    attributes:
+      label: Did the invocation count move?
+      description: >-
+        The one test that settles it: note the invocation count from `--live`,
+        have a subagent make a single tool call, re-run `--live`.
+
+
+        A count that moves means the hook fired and simply wasn't labelled — that
+        is *not* a bug in your harness. A count that does **not** move while a
+        subagent demonstrably made a tool call is a reproduction of
+        [anthropics/claude-code#86405](https://github.com/anthropics/claude-code/issues/86405),
+        which as of 2026-08-16 is open and labelled `needs-info` precisely
+        because it lacks one. If you have that, please say so here and consider
+        posting it upstream too — it's more useful there than here.
+      placeholder: "before: N invocations / after one subagent tool call: M invocations"
+    validations:
+      required: true
+  - type: input
+    id: harness
+    attributes:
+      label: Harness and version
+      description: >-
+        e.g. `claude-code v2.1.233`. The upstream non-reproduction was on
+        v2.1.233, so the version genuinely matters here.
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Your hook registration
+      description: >-
+        The `hooks` block from the settings file you registered it in, plus
+        which file that was. This is where the documented causes usually live.
+      render: json
+    validations:
+      required: true

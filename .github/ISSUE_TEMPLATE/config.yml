@@ -1,0 +1,17 @@
+# Blank issues stay ON deliberately. Forms help me triage, but a repo this
+# small loses more from turning away an unusual report than it gains from
+# clean fields.
+blank_issues_enabled: true
+contact_links:
+  - name: My hook isn't firing (no install needed)
+    url: https://github.com/Prime-agentai/agent-approval-gate/blob/HEAD/docs/hook-not-firing.md
+    about: >-
+      Field guide to the whole "PreToolUse hook never ran" bug class, with a
+      four-line settings entry that answers it without installing anything
+      here. Start here before opening an issue — it may be all you need.
+  - name: Report a security issue or a gate bypass
+    url: https://github.com/Prime-agentai/agent-approval-gate/security/advisories/new
+    about: >-
+      Found a way to make the gate pass something it should have blocked?
+      Report it privately here, not as a public issue. Note that this is a
+      regex hook and not a sandbox — see SECURITY.md for what counts.
