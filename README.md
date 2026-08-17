@@ -138,6 +138,7 @@ Narrow them — the config is a JSON file.
 | `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
 | `tests/test_verify.py` | 31 cases. Five deliberately break `budget_guard.py` and assert `verify.py` catches it — a verifier that passes a broken guard is worse than none. |
 | `tests/test_demo.py` | 32 cases running `demo.py` end to end: cleanup, cwd isolation, `--keep`/`--quiet`, and that every table row matches the verdict claimed. |
+| `tests/test_heartbeat.py` | 30 cases covering the liveness heartbeat, caller attribution and `verify.py --live`: that a hook which never fires is distinguishable from one that fires and allows, that an unmarked call is recorded as unattributed rather than assumed to be the main session, that a hostile marker cannot corrupt the file, and that bookkeeping never turns a block into an allow even when the heartbeat is unwritable. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -681,7 +682,7 @@ python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
 python3 tests/test_verify.py        # 31 cases, incl. mutation tests on verify.py
 python3 tests/test_demo.py          # 32 cases, front-door demo end to end
-python3 tests/test_heartbeat.py     # 19 cases, liveness heartbeat and --live
+python3 tests/test_heartbeat.py     # 30 cases, liveness heartbeat and --live
 ```
 
 `tests/test_budget_guard.py` concentrates on the cases where a plausible
