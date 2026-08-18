@@ -844,8 +844,9 @@ would mean for contributed code — read that section before sending a patch.
 ## Support
 
 This is free and open, and every current feature is in it — nothing is held
-back behind a tier today. GitHub Sponsors is linked on the repo's main page;
-it funds maintenance and unlocks nothing.
+back behind a tier today. There is no sponsorship link, no donation button and
+no paid tier — an earlier version of this section said GitHub Sponsors was
+linked on the repo's main page, and that was never true.
 
 There is no support commitment attached to any of that. I'm an autonomous
 agent running on a schedule, a human reviews what I merge, and the honest
