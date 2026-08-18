@@ -26,6 +26,19 @@ So this script does two separate things:
               an end-to-end test of the thing your harness will actually run,
               not a unit test of an imported function.
 
+There is a third mode, --evidence, which answers a different question from
+the other two. WIRING and BEHAVIOR ask "is this correct now?", for the person
+who just changed something, and their answer evaporates with the terminal
+scrollback. --evidence asks "was this control operating for the whole period,
+and not only at the moment somebody checked?" -- and renders the answer as a
+dated, self-contained artifact you can hand to someone who was not in the
+room: the window covered, how many tool calls the harness routed through the
+gate, what it blocked and when, which exact files were running by digest, and
+a section of equal weight on what none of it proves. That last section is not
+a disclaimer. An evidence artifact that overstates itself is worth less than
+no artifact, because the first competent reader who finds the overstatement
+stops believing the rest of it.
+
 Both directions are checked. Probes that SHOULD block are the obvious half;
 probes that should be ALLOWED matter just as much, because an over-blocking
 gate that fights every tool call is a gate you will turn off within a week,
@@ -81,6 +94,7 @@ and the fix is to split the literal -- never to loosen the rule.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -730,16 +744,30 @@ def run_probe(command, payload, target):
     return proc.returncode, proc.stderr
 
 
-def heartbeat_path(target, command, config):
-    """Resolve the heartbeat file the way gate_guard.py will write it: relative
-    to the directory holding the config it loads, falling back to the project
-    root when no config file exists."""
-    rel = (config or {}).get("heartbeat_path", "approvals/heartbeat.json")
+PROBE_MARKER = "gate-verify-probe"
+# How many individual enforcement events the Markdown report lists. The full
+# set is always in the JSON form; the printed one is meant to be read.
+EVIDENCE_EVENTS = 20
+
+
+def project_path(target, command, config, key, default):
+    """Resolve a config path the way gate_guard.py will: relative to the
+    directory holding the config it loads, falling back to the project root
+    when no config file exists."""
+    rel = (config or {}).get(key, default)
     if not rel:
         return None
     config_path, _ = resolve_config(command, target)
     root = os.path.dirname(config_path) if os.path.isfile(config_path) else target
     return os.path.join(root, rel)
+
+
+def heartbeat_path(target, command, config):
+    """Resolve the heartbeat file the way gate_guard.py will write it: relative
+    to the directory holding the config it loads, falling back to the project
+    root when no config file exists."""
+    return project_path(target, command, config,
+                        "heartbeat_path", "approvals/heartbeat.json")
 
 
 def age_phrase(seconds):
@@ -826,95 +854,112 @@ def subagent_row(hb):
             "unproven -- no call has named a subagent caller")
 
 
-def check_live(target, max_age_hours):
-    """Report whether the harness -- not this script -- has actually invoked
-    the guard, and whether the copy it invoked is the one on disk now."""
-    print(f"agent-approval-gate: liveness check for {target}\n")
-    print("LIVENESS -- has the harness actually called the hook?")
-    rows = []
-    ok = True
+def liveness_facts(target, max_age_hours):
+    """Gather, once, everything both --live and --evidence need.
+
+    --live renders this as a terminal table for the operator who just changed
+    something. --evidence renders the same facts as a dated artifact for
+    somebody who was not in the room. Neither should be able to drift from the
+    other, so there is one gatherer and two renderers.
+
+    Returns a dict. `stop` is None when the check ran to completion; otherwise
+    it names why it could not, and `rows` holds whatever was established before
+    that point.
+    """
+    facts = {
+        "target": target, "rows": [], "ok": True, "stop": None,
+        "command": None, "config": {}, "config_path": None,
+        "hb_path": None, "hb": None,
+        "invocations": 0, "probes": 0, "last": None, "age": None,
+    }
 
     command, err = find_hook_command(target)
     if not command:
-        print(f"  {FAIL:<4}  hook registered in .claude/settings.json    {err}")
-        print("\n  Nothing to check liveness for until the hook is registered. "
-              "Run install.py first.")
-        return 1
-    rows.append((PASS, "hook registered in .claude/settings.json", "yes"))
+        facts["rows"].append(
+            (FAIL, "hook registered in .claude/settings.json", err))
+        facts["ok"] = False
+        facts["stop"] = {"kind": "not-registered", "detail": err}
+        return facts
+    facts["command"] = command
+    facts["rows"].append((PASS, "hook registered in .claude/settings.json", "yes"))
 
     config_path, _ = resolve_config(command, target)
+    facts["config_path"] = config_path
     config = {}
     if os.path.isfile(config_path):
         try:
             with open(config_path) as f:
                 config = json.load(f)
         except ValueError as e:
-            rows.append((WARN, "config parses", f"{config_path}: {e}"))
+            facts["rows"].append((WARN, "config parses", f"{config_path}: {e}"))
+            facts["ok"] = False
+    facts["config"] = config
 
     hb_path = heartbeat_path(target, command, config)
+    facts["hb_path"] = hb_path
     if not hb_path:
-        for row in rows:
-            print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
-        print("\n  heartbeat_path is disabled in your config, so liveness "
-              "cannot be checked. Set it to a path to enable this.")
-        return 1
+        facts["ok"] = False
+        facts["stop"] = {"kind": "heartbeat-disabled", "detail":
+                         "heartbeat_path is disabled in your config"}
+        return facts
 
     try:
         with open(hb_path) as f:
             hb = json.load(f)
     except (FileNotFoundError, ValueError, OSError):
-        rows.append((FAIL, "heartbeat written by the harness",
-                     f"{hb_path} absent or unreadable"))
-        for row in rows:
-            print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
-        print(NEVER_RAN.format(command=command))
-        return 1
+        facts["rows"].append((FAIL, "heartbeat written by the harness",
+                              f"{hb_path} absent or unreadable"))
+        facts["ok"] = False
+        facts["stop"] = {"kind": "never-ran", "detail":
+                         f"{hb_path} absent or unreadable"}
+        return facts
+    facts["hb"] = hb
 
     invocations = hb.get("invocations") or 0
     probes = hb.get("probe_invocations") or 0
     last = hb.get("last_invocation")
+    facts.update({"invocations": invocations, "probes": probes, "last": last})
 
     if not invocations or not last:
         detail = f"{probes} probe invocation(s) only" if probes else "none recorded"
-        rows.append((FAIL, "heartbeat written by the harness", detail))
-        for row in rows:
-            print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
-        print(NEVER_RAN.format(command=command))
-        if probes:
-            print("  Note: the only invocations on record came from verify.py "
-                  "itself. The script runs; the harness is not calling it.")
-        return 1
+        facts["rows"].append((FAIL, "heartbeat written by the harness", detail))
+        facts["ok"] = False
+        facts["stop"] = {"kind": "never-ran", "detail": detail,
+                         "probes_only": bool(probes)}
+        return facts
 
     try:
         age = (datetime.now(timezone.utc)
                - datetime.fromisoformat(last)).total_seconds()
     except ValueError:
         age = None
+    facts["age"] = age
 
     if age is None:
-        rows.append((WARN, "last harness invocation", f"unparseable: {last!r}"))
-        ok = False
+        facts["rows"].append((WARN, "last harness invocation",
+                              f"unparseable: {last!r}"))
+        facts["ok"] = False
     elif age > max_age_hours * 3600:
-        rows.append((WARN, "last harness invocation",
-                     f"{age_phrase(age)} -- older than {max_age_hours}h"))
-        ok = False
+        facts["rows"].append((WARN, "last harness invocation",
+                              f"{age_phrase(age)} -- older than {max_age_hours}h"))
+        facts["ok"] = False
     else:
-        rows.append((PASS, "last harness invocation", age_phrase(age)))
+        facts["rows"].append((PASS, "last harness invocation", age_phrase(age)))
 
-    rows.append((PASS, "invocations recorded",
-                 f"{invocations} from the harness, {probes} from verify.py"))
-    rows.append((PASS, "blocks recorded", str(hb.get("blocks") or 0)))
-    rows.append(subagent_row(hb))
+    facts["rows"].append((PASS, "invocations recorded",
+                          f"{invocations} from the harness, {probes} from verify.py"))
+    facts["rows"].append((PASS, "blocks recorded", str(hb.get("blocks") or 0)))
+    facts["rows"].append(subagent_row(hb))
     # A call arriving under bypassPermissions and still reaching this hook is
     # worth stating out loud: it is the setting under which hook coverage is
     # most often assumed and least often checked.
     modes = (hb.get("identity") or {}).get("permission_modes_seen") \
         if isinstance(hb.get("identity"), dict) else None
     if modes:
-        rows.append((PASS, "permission modes seen", ", ".join(modes)))
+        facts["rows"].append((PASS, "permission modes seen", ", ".join(modes)))
     if hb.get("last_tool"):
-        rows.append((PASS, "last tool call seen",
-                     f"{hb['last_tool']} -> {hb.get('last_decision', '?')}"))
+        facts["rows"].append((PASS, "last tool call seen",
+                              f"{hb['last_tool']} -> {hb.get('last_decision', '?')}"))
 
     # Which copy ran. A harness invoking a stale script in another directory,
     # or loading a config other than the one you edited, presents exactly as
@@ -923,25 +968,26 @@ def check_live(target, max_age_hours):
     wired_guard = wired_guard_path(command, target)
     if ran_guard and wired_guard and \
             os.path.realpath(ran_guard) != os.path.realpath(wired_guard):
-        rows.append((FAIL, "the copy that ran is the one you wired",
-                     f"ran {ran_guard}, settings.json points at {wired_guard}"))
-        ok = False
+        facts["rows"].append((FAIL, "the copy that ran is the one you wired",
+                              f"ran {ran_guard}, settings.json points at {wired_guard}"))
+        facts["ok"] = False
     elif ran_guard:
-        rows.append((PASS, "the copy that ran is the one you wired", ran_guard))
+        facts["rows"].append((PASS, "the copy that ran is the one you wired",
+                              ran_guard))
 
     ran_config = hb.get("config_path")
     if os.path.isfile(config_path) and ran_config and \
             os.path.realpath(ran_config) != os.path.realpath(config_path):
-        rows.append((FAIL, "the config it loaded is the one you edited",
-                     f"loaded {ran_config}, expected {config_path}"))
-        ok = False
+        facts["rows"].append((FAIL, "the config it loaded is the one you edited",
+                              f"loaded {ran_config}, expected {config_path}"))
+        facts["ok"] = False
     elif ran_config:
-        rows.append((PASS, "the config it loaded is the one you edited",
-                     ran_config))
+        facts["rows"].append((PASS, "the config it loaded is the one you edited",
+                              ran_config))
     elif os.path.isfile(config_path):
-        rows.append((WARN, "the config it loaded is the one you edited",
-                     f"ran with built-in defaults, but {config_path} exists"))
-        ok = False
+        facts["rows"].append((WARN, "the config it loaded is the one you edited",
+                              f"ran with built-in defaults, but {config_path} exists"))
+        facts["ok"] = False
 
     # Edited since it last ran => the live session is still enforcing the old
     # rules. This is the single most common "why didn't my change take" cause.
@@ -951,24 +997,55 @@ def check_live(target, max_age_hours):
                 os.path.getmtime(ran_guard), timezone.utc)
             when_ran = datetime.fromisoformat(hb["guard_mtime"])
             if on_disk > when_ran:
-                rows.append((WARN, "guard unchanged since it last ran",
-                             "edited since -- restart the session to load it"))
-                ok = False
+                facts["rows"].append((WARN, "guard unchanged since it last ran",
+                                      "edited since -- restart the session to load it"))
+                facts["ok"] = False
             else:
-                rows.append((PASS, "guard unchanged since it last ran", "yes"))
+                facts["rows"].append(
+                    (PASS, "guard unchanged since it last ran", "yes"))
         except (ValueError, OSError):
             pass
+
+    return facts
+
+
+def check_live(target, max_age_hours):
+    """Report whether the harness -- not this script -- has actually invoked
+    the guard, and whether the copy it invoked is the one on disk now."""
+    print(f"agent-approval-gate: liveness check for {target}\n")
+    print("LIVENESS -- has the harness actually called the hook?")
+    facts = liveness_facts(target, max_age_hours)
+    rows, stop = facts["rows"], facts["stop"]
+
+    if stop and stop["kind"] == "not-registered":
+        print(f"  {FAIL:<4}  hook registered in .claude/settings.json    "
+              f"{stop['detail']}")
+        print("\n  Nothing to check liveness for until the hook is registered. "
+              "Run install.py first.")
+        return 1
 
     for row in rows:
         print(f"  {row[0]:<4}  {row[1]:<46}  {row[2]}")
 
+    if stop and stop["kind"] == "heartbeat-disabled":
+        print("\n  heartbeat_path is disabled in your config, so liveness "
+              "cannot be checked. Set it to a path to enable this.")
+        return 1
+
+    if stop and stop["kind"] == "never-ran":
+        print(NEVER_RAN.format(command=facts["command"]))
+        if stop.get("probes_only"):
+            print("  Note: the only invocations on record came from verify.py "
+                  "itself. The script runs; the harness is not calling it.")
+        return 1
+
     # Not folded into `ok`: an unproven subagent is the normal state of a fresh
     # install, not a misconfiguration, and failing the check for it would train
     # people to ignore the one line here that reports a real wiring fault.
-    if subagent_row(hb)[0] != PASS:
-        print(SUBAGENT_UNPROVEN.format(invocations=invocations))
+    if subagent_row(facts["hb"])[0] != PASS:
+        print(SUBAGENT_UNPROVEN.format(invocations=facts["invocations"]))
 
-    if ok:
+    if facts["ok"]:
         print("\nThe harness is calling the guard, and calling the copy you "
               "think it is.\nThis says nothing about whether the rules are "
               "correct -- run verify.py with no arguments for that.")
@@ -977,6 +1054,531 @@ def check_live(target, max_age_hours):
           "line up.\nA WARN here means what you edited and what is enforcing "
           "may be different things.")
     return 1
+
+
+# ---------------------------------------------------------------------------
+# --evidence: the same facts, as something you can hand to someone else
+# ---------------------------------------------------------------------------
+#
+# --live answers "is my hook working right now", for the person who just
+# changed something. It is a terminal printout and it evaporates.
+#
+# There is a second, different question: "was this control operating for the
+# whole period, and not just at the moment somebody checked?" Design-time
+# evidence -- a config file, a screenshot of a passing test -- cannot answer
+# it. Operating evidence can, and that is what the heartbeat plus the blocked
+# log already are; they were simply never packaged as something portable.
+#
+# So --evidence renders a dated, self-contained report: what the control is,
+# what window it covers, how many calls the harness routed through it, what it
+# blocked and when, which exact files were running (by digest), and -- at
+# equal weight, section 5 -- what none of this proves. The limits section is
+# not a disclaimer. An evidence artifact that overstates itself is worth less
+# than none, because the first competent reader who finds the overstatement
+# stops believing the rest.
+
+LIMITS = [
+    ("Counters are a lower bound, never an overcount.",
+     "The heartbeat is a best-effort read-modify-write. Two hook processes "
+     "finishing at once can lose an increment. Where this report says N calls "
+     "were routed through the gate, the true number is N or more."),
+    ("This is the operator's own record, not a third party's.",
+     "Every file cited here lives on the machine being reported on, and "
+     "anyone with write access to it could edit them. The digests below "
+     "detect accidental change and drift between copies; they are not "
+     "tamper-proof against the report's own author, and nothing self-hosted "
+     "could be."),
+    ("An absent subagent marker proves nothing either way.",
+     "If no call has ever named a subagent caller, that is equally consistent "
+     "with no subagent having run, with subagent calls arriving unlabelled, "
+     "and with subagent calls never reaching the hook at all. Only a positive "
+     "marker proves coverage, which is why the coverage line reads 'unproven' "
+     "rather than 'main session only'."),
+    ("Coverage is continuous only if the harness ran continuously.",
+     "The window below is first invocation to last. Gaps inside it are not "
+     "detectable from the heartbeat -- a harness that was switched off, or "
+     "running without the hook registered, leaves no mark. This report shows "
+     "that the gate was live at the ends of the window and busy in between; "
+     "it does not certify that no tool call ever bypassed it."),
+    ("Blocks are what the rules matched, not what was actually dangerous.",
+     "Rule matching is textual. A block is evidence the control fired, not "
+     "evidence the blocked action would have caused harm -- and an absence of "
+     "blocks is not evidence that nothing was attempted."),
+]
+
+
+def sha256_file(path):
+    """Digest a file in chunks. Returns None rather than raising: a missing
+    artifact is a fact to report, not a reason to produce no report."""
+    if not path or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return "sha256:" + h.hexdigest()
+
+
+def file_facts(path):
+    out = {"path": path, "present": bool(path and os.path.isfile(path)),
+           "sha256": None, "bytes": None, "modified": None}
+    if out["present"]:
+        out["sha256"] = sha256_file(path)
+        try:
+            st = os.stat(path)
+            out["bytes"] = st.st_size
+            out["modified"] = datetime.fromtimestamp(
+                st.st_mtime, timezone.utc).isoformat()
+        except OSError:
+            pass
+    return out
+
+
+def duration_phrase(seconds):
+    if seconds is None:
+        return "unknown"
+    if seconds < 90:
+        return f"{seconds:.0f} seconds"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} minutes"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f} hours"
+    return f"{seconds / 86400:.1f} days"
+
+
+def read_block_log(path, window_start, window_end, include_attempts):
+    """Summarise the blocked-action log: how many real blocks, which rules,
+    and when. Probe blocks written by verify.py are separated out rather than
+    dropped, because a report that silently discards records is a report that
+    can be argued with."""
+    # A window only exists if the heartbeat established one. With no window,
+    # these records cannot be attributed to a period of operation at all --
+    # counting them as "in window" would let a report with no liveness
+    # evidence still present a tally that reads like enforcement history.
+    out = {"path": path, "present": False, "readable": True, "lines": 0,
+           "malformed": 0, "probes": 0, "in_window": 0, "before_window": 0,
+           "window_known": bool(window_start and window_end),
+           "by_rule": {}, "by_tier": {}, "events": [],
+           "first": None, "last": None}
+    if not path or not os.path.isfile(path):
+        return out
+    out["present"] = True
+    try:
+        with open(path) as f:
+            raw = f.readlines()
+    except OSError:
+        out["readable"] = False
+        return out
+
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        out["lines"] += 1
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            out["malformed"] += 1
+            continue
+        if not isinstance(entry, dict):
+            out["malformed"] += 1
+            continue
+        if PROBE_MARKER in str(entry.get("attempted", "")):
+            out["probes"] += 1
+            continue
+        ts = entry.get("ts")
+        when = None
+        if ts:
+            try:
+                when = datetime.fromisoformat(ts)
+            except ValueError:
+                when = None
+        if when and window_start and when < window_start:
+            out["before_window"] += 1
+            continue
+        if when and window_end and when > window_end:
+            # Later than the last recorded invocation: the log is ahead of the
+            # heartbeat. Counted, and visible in the totals, but not silently
+            # folded into the window.
+            out["before_window"] += 0
+        out["in_window"] += 1
+        rule = entry.get("rule") or "(none)"
+        out["by_rule"][rule] = out["by_rule"].get(rule, 0) + 1
+        tier = entry.get("trust_tier_at_block")
+        if tier is not None:
+            key = str(tier)
+            out["by_tier"][key] = out["by_tier"].get(key, 0) + 1
+        if ts:
+            out["first"] = min(out["first"], ts) if out["first"] else ts
+            out["last"] = max(out["last"], ts) if out["last"] else ts
+        event = {"ts": ts, "rule": rule, "tool": entry.get("tool"),
+                 "trust_tier_at_block": tier}
+        if include_attempts:
+            event["attempted"] = entry.get("attempted")
+        out["events"].append(event)
+    return out
+
+
+def evidence_report(target, max_age_hours, include_attempts=False):
+    """Build the report as data. Rendering is separate, so the JSON and the
+    Markdown can never disagree about a number."""
+    generated = datetime.now(timezone.utc)
+    facts = liveness_facts(target, max_age_hours)
+    hb = facts["hb"] or {}
+    config = facts["config"] or {}
+    command = facts["command"]
+
+    first = hb.get("first_invocation")
+    last = hb.get("last_invocation")
+    span = None
+    win_start = win_end = None
+    for value, slot in ((first, "start"), (last, "end")):
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if slot == "start":
+            win_start = parsed
+        else:
+            win_end = parsed
+    if win_start and win_end:
+        span = (win_end - win_start).total_seconds()
+
+    blocked_log = None
+    if command:
+        blocked_log = project_path(target, command, config, "blocked_log",
+                                   "approvals/blocked.jsonl")
+    blocks = read_block_log(blocked_log, win_start, win_end, include_attempts)
+
+    identity = hb.get("identity") if isinstance(hb.get("identity"), dict) else {}
+    rule_ids = sorted(i for i in configured_rule_ids(config) if i)
+
+    state_path = None
+    tier = None
+    if command:
+        state_path = project_path(target, command, config, "state_path", "STATE.json")
+    if state_path and os.path.isfile(state_path):
+        try:
+            with open(state_path) as f:
+                tier = json.load(f).get(
+                    config.get("trust_tier_field", "trust_tier"))
+        except (ValueError, OSError):
+            tier = None
+
+    body = {
+        "report": "gate-enforcement-evidence",
+        "schema": 1,
+        "generated_at": generated.isoformat(),
+        "generated_by": "agent-approval-gate verify.py --evidence",
+        "project": target,
+        "status": {
+            "control_active": bool(facts["ok"] and not facts["stop"]),
+            "reason": (facts["stop"] or {}).get("kind"),
+            "checks_passed": sum(1 for r in facts["rows"] if r[0] == PASS),
+            "checks_warned": sum(1 for r in facts["rows"] if r[0] == WARN),
+            "checks_failed": sum(1 for r in facts["rows"] if r[0] == FAIL),
+        },
+        "window": {
+            "first_invocation": first,
+            "last_invocation": last,
+            "seconds": span,
+            "human": duration_phrase(span),
+            "last_invocation_age_seconds": facts["age"],
+            "stale_after_hours": max_age_hours,
+        },
+        "activity": {
+            "harness_invocations": facts["invocations"],
+            "verify_probe_invocations": facts["probes"],
+            "blocks_recorded_by_guard": hb.get("blocks") or 0,
+            "last_tool": hb.get("last_tool"),
+            "last_decision": hb.get("last_decision"),
+            "last_rule": hb.get("last_rule"),
+            "permission_modes_seen": identity.get("permission_modes_seen") or [],
+            "subagent_coverage": identity.get("subagent_coverage") or "unproven",
+            "callers_seen": {
+                name: {"invocations": row.get("invocations"),
+                       "blocks": row.get("blocks"),
+                       "subagent": bool(row.get("subagent")),
+                       "first_seen": row.get("first_seen"),
+                       "last_seen": row.get("last_seen")}
+                for name, row in sorted(
+                    (identity.get("agents") or {}).items())
+                if isinstance(row, dict)},
+        },
+        "control": {
+            "hook_command": command,
+            "rule_ids_configured": rule_ids,
+            "rule_ids_source": "config" if rule_ids else "built-in defaults",
+            "protected_paths": config.get("protected_paths") or [],
+            "trust_tier_at_report": tier,
+            "min_tier_for_tier_gated": config.get("min_tier_for_tier_gated"),
+        },
+        "enforcement": blocks,
+        "checks": [{"status": s, "check": label, "detail": detail}
+                   for s, label, detail in facts["rows"]],
+        "artifacts": {
+            "guard_that_ran": file_facts(hb.get("guard_path")),
+            "guard_wired_in_settings": file_facts(
+                wired_guard_path(command, target) if command else None),
+            "config": file_facts(facts["config_path"]),
+            "heartbeat": file_facts(facts["hb_path"]),
+            "blocked_log": file_facts(blocked_log),
+            "verifier": file_facts(os.path.abspath(__file__)),
+        },
+        "limits": [{"claim": head, "detail": detail} for head, detail in LIMITS],
+    }
+    # Digest of the body as rendered, so two copies of this report can be
+    # compared for equality without reading them. Computed last and stored
+    # outside the body it covers -- a digest that included itself could not be
+    # recomputed by the reader, which would make it decorative.
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return {"body": body,
+            "digest": "sha256:" + hashlib.sha256(
+                canonical.encode("utf-8")).hexdigest()}
+
+
+def render_evidence_markdown(report):
+    b = report["body"]
+    L = []
+    add = L.append
+    status = b["status"]
+    active = status["control_active"]
+
+    add("# Gate enforcement evidence")
+    add("")
+    add(f"**Project:** `{b['project']}`  ")
+    add(f"**Generated:** {b['generated_at']} (UTC)  ")
+    add(f"**Report digest:** `{report['digest']}`")
+    add("")
+    add("Produced by `verify.py --evidence` from "
+        "[agent-approval-gate](https://github.com/Prime-agentai/agent-approval-gate). "
+        "Read section 5 before relying on anything above it.")
+    add("")
+
+    add("## 1. Summary")
+    add("")
+    add("| | |")
+    add("|---|---|")
+    add(f"| Control status at report time | **{'ACTIVE' if active else 'NOT ESTABLISHED'}** |")
+    w = b["window"]
+    if w["first_invocation"] and w["last_invocation"]:
+        add(f"| Evidence window | {w['first_invocation']} → {w['last_invocation']} |")
+        add(f"| Window length | {w['human']} |")
+    a = b["activity"]
+    add(f"| Tool calls the harness routed through the gate | {a['harness_invocations']:,} |")
+    add(f"| Calls blocked by the gate | {a['blocks_recorded_by_guard']:,} |")
+    # Without the log there is nothing to count rules from. Printing 0 would
+    # read as "no rule ever fired", which is a different claim from "the
+    # per-rule breakdown is unavailable" -- and the block count above may well
+    # be non-zero.
+    e0 = b["enforcement"]
+    if not (e0["present"] and e0["readable"]):
+        add("| Distinct rules that fired | unavailable — no readable "
+            "blocked-action log |")
+    elif e0["window_known"]:
+        add(f"| Distinct rules that fired in the window | {len(e0['by_rule'])} |")
+    else:
+        add(f"| Distinct rules in the block log | {len(e0['by_rule'])} "
+            "(not attributable to a window — see §4) |")
+    add(f"| Liveness checks passed / warned / failed | "
+        f"{status['checks_passed']} / {status['checks_warned']} / {status['checks_failed']} |")
+    add(f"| Subagent coverage | {a['subagent_coverage']} |")
+    if a["permission_modes_seen"]:
+        add(f"| Permission modes observed | {', '.join(a['permission_modes_seen'])} |")
+    add("")
+    if not active:
+        add(f"> **This report does not evidence an operating control.** "
+            f"Reason: `{status['reason'] or 'one or more checks did not pass'}`. "
+            f"The sections below are reported as found, and section 2 names "
+            f"what did not line up.")
+        add("")
+
+    add("## 2. Was the control operating?")
+    add("")
+    add("Each row was established by reading the heartbeat `gate_guard.py` "
+        "writes on every invocation -- not by running the guard from this "
+        "script, which would prove only that the script works.")
+    add("")
+    add("| | Check | Evidence |")
+    add("|---|---|---|")
+    for row in b["checks"]:
+        detail = str(row["detail"]).replace("|", "\\|")
+        add(f"| {row['status']} | {row['check']} | {detail} |")
+    add("")
+
+    add("## 3. What the control is")
+    add("")
+    c = b["control"]
+    add(f"- **Hook command:** `{c['hook_command'] or '(none registered)'}`")
+    add(f"- **Rules configured ({c['rule_ids_source']}):** "
+        + (", ".join(f"`{r}`" for r in c["rule_ids_configured"]) or "_none listed_"))
+    if c["protected_paths"]:
+        add("- **Files no agent tool call may write:** "
+            + ", ".join(f"`{p}`" for p in c["protected_paths"]))
+    if c["trust_tier_at_report"] is not None:
+        add(f"- **Trust tier at report time:** {c['trust_tier_at_report']}"
+            + (f" (tier-gated rules apply below {c['min_tier_for_tier_gated']})"
+               if c["min_tier_for_tier_gated"] is not None else ""))
+    add("")
+    callers = a["callers_seen"]
+    if callers:
+        add("**Callers the harness routed through the gate.** Whether a "
+            "control binds on delegated work is usually assumed; this is the "
+            "measurement. See the coverage limit in section 5.")
+        add("")
+        add("| Caller | Subagent | Calls | Blocked | First seen | Last seen |")
+        add("|---|---|---|---|---|---|")
+        for name, row in callers.items():
+            add(f"| `{name}` | {'yes' if row['subagent'] else 'not marked'} | "
+                f"{row.get('invocations') or 0:,} | {row.get('blocks') or 0:,} | "
+                f"{row.get('first_seen') or '—'} | {row.get('last_seen') or '—'} |")
+        add("")
+
+    add("## 4. Enforcement events")
+    add("")
+    e = b["enforcement"]
+    if not e["present"]:
+        add(f"No blocked-action log at `{e['path']}`. The guard records block "
+            "counts in the heartbeat regardless, so section 1's block count "
+            "still stands; the per-event detail below is unavailable.")
+    elif not e["readable"]:
+        add(f"`{e['path']}` exists but could not be read.")
+    else:
+        counted = "counted" if e["window_known"] else "counted, UNATTRIBUTED"
+        add(f"Source: `{e['path']}` — {e['lines']:,} record(s) total, "
+            f"{e['probes']:,} written by `verify.py` probes and excluded, "
+            f"{e['before_window']:,} predating this window and excluded, "
+            f"**{e['in_window']:,} {counted}**"
+            + (f", {e['malformed']:,} unparseable" if e["malformed"] else "") + ".")
+        add("")
+        if not e["window_known"]:
+            add("> **These records are not attributed to an operating "
+                "period.** Section 2 could not establish a window, so while "
+                "the log shows blocks were written at some point, nothing "
+                "here evidences that the control was operating across any "
+                "particular span. Read the counts below as history of the "
+                "file, not as evidence of coverage.")
+            add("")
+        if e["by_rule"]:
+            add("| Rule | Times fired |")
+            add("|---|---|")
+            for rule, n in sorted(e["by_rule"].items(), key=lambda kv: -kv[1]):
+                add(f"| `{rule}` | {n:,} |")
+            add("")
+        if e["events"]:
+            recent = e["events"][-EVIDENCE_EVENTS:]
+            add(f"Most recent {len(recent)} of {len(e['events'])}:")
+            add("")
+            head = "| When (UTC) | Rule | Tool |"
+            sep = "|---|---|---|"
+            if any("attempted" in ev for ev in recent):
+                head += " Attempted |"
+                sep += "---|"
+            add(head)
+            add(sep)
+            for ev in reversed(recent):
+                line = (f"| {ev.get('ts') or '?'} | `{ev.get('rule')}` | "
+                        f"{ev.get('tool') or '?'} |")
+                if "attempted" in ev:
+                    text = str(ev.get("attempted") or "")[:120].replace("|", "\\|")
+                    line += f" `{text}` |"
+                add(line)
+            add("")
+            if not any("attempted" in ev for ev in recent):
+                add("_The text of each blocked action is held back by default, "
+                    "because it is the operator's command history and is not "
+                    "needed to evidence that the control fired. Re-run with "
+                    "`--include-attempts` to include it._")
+                add("")
+        if e["in_window"] != b["activity"]["blocks_recorded_by_guard"]:
+            add(f"> **Note a discrepancy rather than hiding it:** the guard's "
+                f"own counter says {b['activity']['blocks_recorded_by_guard']:,} "
+                f"block(s); this log yields {e['in_window']:,} in-window "
+                f"record(s). Both writes are best-effort and neither is "
+                f"authoritative over the other. The likely causes are a log "
+                f"rotated or edited after the fact, a counter that lost a "
+                f"concurrent increment, or blocks predating the current log "
+                f"file.")
+            add("")
+
+    add("")
+    add("## 5. What this evidence does not prove")
+    add("")
+    add("Stated at the same weight as the rest, and worth reading before "
+        "citing any number above.")
+    add("")
+    for item in b["limits"]:
+        add(f"- **{item['claim']}** {item['detail']}")
+    add("")
+
+    add("## 6. Exactly which files were running")
+    add("")
+    add("An enforcement claim is about specific bytes. These are the ones this "
+        "report is about; digest them yourself to confirm you are looking at "
+        "the same thing.")
+    add("")
+    add("| Artifact | Path | Digest | Bytes | Modified (UTC) |")
+    add("|---|---|---|---|---|")
+    labels = {
+        "guard_that_ran": "Guard the harness actually invoked",
+        "guard_wired_in_settings": "Guard named in settings.json",
+        "config": "Gate config",
+        "heartbeat": "Heartbeat (source of section 2)",
+        "blocked_log": "Blocked-action log (source of section 4)",
+        "verifier": "This verifier",
+    }
+    for key, label in labels.items():
+        f = b["artifacts"].get(key) or {}
+        if not f.get("path"):
+            continue
+        digest = f.get("sha256") or "_absent_"
+        size = f"{f['bytes']:,}" if f.get("bytes") is not None else "—"
+        add(f"| {label} | `{f['path']}` | `{digest}` | {size} | "
+            f"{f.get('modified') or '—'} |")
+    add("")
+    add("---")
+    add("")
+    add(f"Report digest `{report['digest']}` covers every field of the JSON "
+        "form of this report (`--evidence --format json`), canonicalised with "
+        "sorted keys. Recompute it to detect accidental modification; see "
+        "section 5 on what it is not.")
+    add("")
+    return "\n".join(L)
+
+
+def check_evidence(target, max_age_hours, fmt, out_path, include_attempts):
+    report = evidence_report(target, max_age_hours, include_attempts)
+    if fmt == "json":
+        text = json.dumps({**report["body"], "report_digest": report["digest"]},
+                          indent=2) + "\n"
+    else:
+        text = render_evidence_markdown(report)
+
+    if out_path:
+        try:
+            directory = os.path.dirname(os.path.abspath(out_path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(out_path, "w") as f:
+                f.write(text)
+        except OSError as e:
+            print(f"could not write {out_path}: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote {out_path}  ({len(text):,} bytes)")
+        print(f"digest {report['digest']}")
+    else:
+        sys.stdout.write(text)
+
+    # Exit code carries the finding, so this is usable in a scheduled job: 0
+    # means an operating control was evidenced, 1 means the report was still
+    # produced but says the control was not established. A report that always
+    # exits 0 would let a broken gate pass a nightly check silently.
+    return 0 if report["body"]["status"]["control_active"] else 1
 
 
 def main():
@@ -993,8 +1595,27 @@ def main():
     ap.add_argument("--max-age", type=float, default=24.0, metavar="HOURS",
                     help="With --live, how old the last harness invocation may "
                          "be before it is flagged stale (default: 24)")
+    ap.add_argument("--evidence", action="store_true",
+                    help="Render the same liveness facts as a dated, portable "
+                         "evidence report -- what the control is, what window "
+                         "it covers, what it blocked, which files were "
+                         "running, and what none of it proves. Exits 1 if it "
+                         "cannot evidence an operating control")
+    ap.add_argument("--format", choices=("md", "json"), default="md",
+                    help="With --evidence, the output format (default: md)")
+    ap.add_argument("--out", metavar="PATH",
+                    help="With --evidence, write to PATH instead of stdout")
+    ap.add_argument("--include-attempts", action="store_true",
+                    help="With --evidence, include the text of each blocked "
+                         "action. Held back by default: it is your command "
+                         "history, and it is not needed to evidence that the "
+                         "control fired")
     args = ap.parse_args()
     target = os.path.abspath(args.target)
+
+    if args.evidence:
+        return check_evidence(target, args.max_age, args.format, args.out,
+                              args.include_attempts)
 
     if args.live:
         return check_live(target, args.max_age)

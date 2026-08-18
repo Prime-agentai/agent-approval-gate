@@ -293,10 +293,17 @@ class CheckLiveTests(unittest.TestCase):
             self.assertIn("the config it loaded", out)
 
     def test_flags_a_guard_edited_since_it_last_ran(self):
+        # The recorded mtime is offset from the guard's ACTUAL mtime, not from
+        # now. Anchoring it to now made this a time bomb: it asserts that the
+        # file on disk is newer than the heartbeat says, which was only true
+        # while the checkout itself was under two days old. A contributor with
+        # an older working copy saw this one test fail for no reason they
+        # could act on -- and our own copy started failing at exactly the
+        # 48-hour mark.
         with tempfile.TemporaryDirectory() as tmp:
             project(tmp)
-            stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-            write_heartbeat(tmp, guard_mtime=stale)
+            on_disk = datetime.fromtimestamp(os.path.getmtime(GUARD), timezone.utc)
+            write_heartbeat(tmp, guard_mtime=(on_disk - timedelta(days=2)).isoformat())
             code, out = live(tmp)
             self.assertEqual(code, 1)
             self.assertIn("restart the session", out)
@@ -449,6 +456,330 @@ class SubagentCoverageTests(unittest.TestCase):
             code, out = live(tmp)
             self.assertEqual(code, 0)
             self.assertIn("guard predates identity tracking", out)
+
+
+class EvidenceReportTests(unittest.TestCase):
+    """verify.py --evidence.
+
+    --live is read by the person who just changed something; --evidence is
+    read by someone who was not there, possibly months later, possibly
+    adversarially. That difference sets what these tests protect:
+
+      * It must never claim an operating control it cannot evidence. The
+        first three tests here are the ones that matter -- a report that says
+        ACTIVE for a hook which never ran would be worse than no report,
+        because it converts "unknown" into a documented false assurance.
+      * The Markdown and the JSON are two renderings of one gather. If they
+        can disagree about a number, the artifact is not evidence of
+        anything, so they are asserted against each other.
+      * Probe blocks -- the ones verify.py writes itself -- must never be
+        counted as enforcement events. Otherwise running the verifier inflates
+        the evidence the verifier produces.
+      * The limits section is load-bearing content, not boilerplate, and is
+        asserted present. An artifact that drops its own caveats while
+        keeping its numbers is the failure mode worth a test.
+    """
+
+    def report(self, tmp, **kw):
+        return verify.evidence_report(os.path.abspath(tmp),
+                                      kw.pop("max_age_hours", 24.0), **kw)
+
+    def test_never_claims_active_when_the_hook_never_ran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)  # no heartbeat at all
+            report = self.report(tmp)
+            self.assertFalse(report["body"]["status"]["control_active"])
+            self.assertEqual(report["body"]["status"]["reason"], "never-ran")
+            md = verify.render_evidence_markdown(report)
+            self.assertIn("NOT ESTABLISHED", md)
+            self.assertNotIn("| Control status at report time | **ACTIVE** |", md)
+
+    def test_never_claims_active_on_probe_invocations_alone(self):
+        # verify.py's own probes prove the script runs and prove nothing about
+        # the harness. An artifact built only from them evidences nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, invocations=0, probe_invocations=9,
+                            last_invocation=None)
+            report = self.report(tmp)
+            self.assertFalse(report["body"]["status"]["control_active"])
+            self.assertEqual(report["body"]["status"]["reason"], "never-ran")
+
+    def test_never_claims_active_when_a_different_copy_ran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, guard_path="/somewhere/else/gate_guard.py")
+            report = self.report(tmp)
+            self.assertFalse(report["body"]["status"]["control_active"])
+            self.assertTrue(report["body"]["status"]["checks_failed"])
+
+    def test_reports_active_on_a_healthy_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            report = self.report(tmp)
+            self.assertTrue(report["body"]["status"]["control_active"])
+            self.assertEqual(report["body"]["activity"]["harness_invocations"], 4)
+            md = verify.render_evidence_markdown(report)
+            self.assertIn("**ACTIVE**", md)
+
+    def test_window_is_the_recorded_span_not_the_report_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            first = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            write_heartbeat(tmp, first_invocation=first)
+            body = self.report(tmp)["body"]
+            self.assertEqual(body["window"]["first_invocation"], first)
+            self.assertGreater(body["window"]["seconds"], 29 * 86400)
+            self.assertIn("days", body["window"]["human"])
+
+    def test_markdown_and_json_cannot_disagree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, invocations=1234, blocks=7)
+            report = self.report(tmp)
+            md = verify.render_evidence_markdown(report)
+            self.assertEqual(report["body"]["activity"]["harness_invocations"], 1234)
+            self.assertIn("1,234", md)
+            self.assertIn("| Calls blocked by the gate | 7 |", md)
+
+    def test_digest_is_reproducible_and_covers_the_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            report = self.report(tmp)
+            body = dict(report["body"])
+            canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+            import hashlib
+            self.assertEqual(
+                report["digest"],
+                "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+            body["activity"] = dict(body["activity"], harness_invocations=999999)
+            tampered = json.dumps(body, sort_keys=True, separators=(",", ":"))
+            self.assertNotEqual(
+                report["digest"],
+                "sha256:" + hashlib.sha256(tampered.encode("utf-8")).hexdigest())
+
+    def test_probe_blocks_are_excluded_from_enforcement_events(self):
+        # Running the verifier must not inflate the evidence it produces.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            now = datetime.now(timezone.utc).isoformat()
+            with open(log, "w") as f:
+                f.write(json.dumps({"ts": now, "rule": "FUND_MOVEMENT",
+                                    "tool": "Bash", "attempted": _FUND_MOVE,
+                                    "trust_tier_at_block": 0}) + "\n")
+                f.write(json.dumps({"ts": now, "rule": "FUND_MOVEMENT",
+                                    "tool": "Bash",
+                                    "attempted": _FUND_MOVE + "  # gate-verify-probe",
+                                    "trust_tier_at_block": 0}) + "\n")
+            e = self.report(tmp)["body"]["enforcement"]
+            self.assertEqual(e["lines"], 2)
+            self.assertEqual(e["probes"], 1)
+            self.assertEqual(e["in_window"], 1)
+            self.assertEqual(e["by_rule"], {"FUND_MOVEMENT": 1})
+
+    def test_blocked_command_text_is_held_back_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            with open(log, "w") as f:
+                f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                    "rule": "FUND_MOVEMENT", "tool": "Bash",
+                                    "attempted": _FUND_MOVE}) + "\n")
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertNotIn(_FUND_MOVE, md)
+            self.assertIn("FUND_MOVEMENT", md)
+
+            md2 = verify.render_evidence_markdown(
+                self.report(tmp, include_attempts=True))
+            self.assertIn(_FUND_MOVE, md2)
+
+    def test_events_before_the_window_are_excluded_not_silently_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            first = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            write_heartbeat(tmp, first_invocation=first)
+            old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            with open(log, "w") as f:
+                f.write(json.dumps({"ts": old, "rule": "SPEND",
+                                    "tool": "Bash", "attempted": "x"}) + "\n")
+            e = self.report(tmp)["body"]["enforcement"]
+            self.assertEqual(e["in_window"], 0)
+            self.assertEqual(e["before_window"], 1)
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("predating this window", md)
+
+    def test_blocks_are_unattributed_when_no_window_could_be_established(self):
+        # The report must not present a tally that reads like enforcement
+        # history when section 2 could not evidence the control ran at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)  # no heartbeat -> no window
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "w") as f:
+                f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                    "rule": "SPEND", "tool": "Bash",
+                                    "attempted": "x"}) + "\n")
+            report = self.report(tmp)
+            self.assertFalse(report["body"]["status"]["control_active"])
+            self.assertFalse(report["body"]["enforcement"]["window_known"])
+            md = verify.render_evidence_markdown(report)
+            self.assertIn("UNATTRIBUTED", md)
+            self.assertIn("not attributed to an operating period", md)
+            self.assertNotIn("fired in the window", md)
+
+    def test_a_malformed_log_line_is_counted_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            with open(log, "w") as f:
+                f.write("{not json\n")
+                f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                    "rule": "SPEND", "tool": "Bash",
+                                    "attempted": "x"}) + "\n")
+            e = self.report(tmp)["body"]["enforcement"]
+            self.assertEqual(e["malformed"], 1)
+            self.assertEqual(e["in_window"], 1)
+
+    def test_a_missing_block_log_is_reported_not_treated_as_zero_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, blocks=3)
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("No blocked-action log", md)
+            self.assertIn("| Calls blocked by the gate | 3 |", md)
+
+    def test_counter_and_log_disagreement_is_surfaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, blocks=5)
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            with open(log, "w") as f:
+                f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                    "rule": "SPEND", "tool": "Bash",
+                                    "attempted": "x"}) + "\n")
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("discrepancy", md)
+
+    def test_the_limits_section_is_present_and_not_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            report = self.report(tmp)
+            self.assertGreaterEqual(len(report["body"]["limits"]), 5)
+            md = verify.render_evidence_markdown(report)
+            self.assertIn("What this evidence does not prove", md)
+            self.assertIn("lower bound", md)
+            self.assertIn("not tamper-proof", md)
+
+    def test_records_the_digest_of_the_guard_that_actually_ran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            artifacts = self.report(tmp)["body"]["artifacts"]
+            ran = artifacts["guard_that_ran"]
+            self.assertTrue(ran["present"])
+            self.assertTrue(ran["sha256"].startswith("sha256:"))
+            self.assertEqual(ran["sha256"], verify.sha256_file(GUARD))
+            self.assertEqual(ran["bytes"], os.path.getsize(GUARD))
+
+    def test_subagent_coverage_is_carried_into_the_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, identity={
+                "subagent_coverage": "observed",
+                "permission_modes_seen": ["default", "bypassPermissions"],
+                "agents": {"researcher": {"invocations": 3, "blocks": 1,
+                                          "subagent": True,
+                                          "first_seen": "2026-01-01T00:00:00+00:00",
+                                          "last_seen": "2026-01-02T00:00:00+00:00"}}})
+            body = self.report(tmp)["body"]
+            self.assertEqual(body["activity"]["subagent_coverage"], "observed")
+            self.assertTrue(body["activity"]["callers_seen"]["researcher"]["subagent"])
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("bypassPermissions", md)
+            self.assertIn("researcher", md)
+
+    def test_unproven_subagent_coverage_is_never_rendered_as_proven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)  # no identity block
+            body = self.report(tmp)["body"]
+            self.assertEqual(body["activity"]["subagent_coverage"], "unproven")
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("| Subagent coverage | unproven |", md)
+            # The one place the phrase may appear is section 5, explaining why
+            # the report refuses to make that claim.
+            self.assertNotIn("main session only", md.split("## 5.")[0])
+
+    def test_cli_writes_a_file_and_exit_code_carries_the_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            out = os.path.join(tmp, "out", "evidence.md")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = verify.check_evidence(os.path.abspath(tmp), 24.0,
+                                             "md", out, False)
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.isfile(out))
+            with open(out) as f:
+                self.assertIn("# Gate enforcement evidence", f.read())
+            self.assertIn("digest sha256:", buf.getvalue())
+
+    def test_cli_exits_nonzero_when_no_control_can_be_evidenced(self):
+        # So a nightly job that produces a report but cannot evidence the
+        # control fails loudly rather than filing a reassuring artifact.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = verify.check_evidence(os.path.abspath(tmp), 24.0,
+                                             "md", None, False)
+            self.assertEqual(code, 1)
+
+    def test_json_form_parses_and_carries_the_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp)
+            out = os.path.join(tmp, "evidence.json")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                verify.check_evidence(os.path.abspath(tmp), 24.0, "json",
+                                      out, False)
+            with open(out) as f:
+                loaded = json.load(f)
+            self.assertEqual(loaded["report"], "gate-enforcement-evidence")
+            self.assertTrue(loaded["report_digest"].startswith("sha256:"))
+            self.assertIn("limits", loaded)
+
+    def test_end_to_end_against_a_real_invocation(self):
+        # Everything above uses a synthesised heartbeat. This one drives the
+        # registered hook command for real, blocks on a real rule, and builds
+        # the artifact from what the guard itself wrote -- the only test here
+        # that would catch the two halves agreeing on a format neither the
+        # guard nor the harness actually produces.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = project(tmp)
+            invoke(tmp, config_path,
+                   {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+            invoke(tmp, config_path,
+                   {"tool_name": "Bash", "tool_input": {"command": _FUND_MOVE}})
+            body = self.report(tmp)["body"]
+            self.assertTrue(body["status"]["control_active"])
+            self.assertEqual(body["activity"]["harness_invocations"], 2)
+            self.assertEqual(body["activity"]["blocks_recorded_by_guard"], 1)
+            self.assertEqual(body["enforcement"]["in_window"], 1)
+            self.assertIn("FUND_MOVEMENT", body["enforcement"]["by_rule"])
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("**ACTIVE**", md)
+            self.assertNotIn(_FUND_MOVE, md)
 
 
 if __name__ == "__main__":

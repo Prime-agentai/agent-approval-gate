@@ -121,7 +121,7 @@ Narrow them — the config is a JSON file.
 |---|---|
 | `demo.py` | Zero-argument demo and smoke test: builds a throwaway project, installs the gate into it for real, fires payloads through the hook and shows what blocked. Deletes the temp project unless you pass `--keep`. |
 | `install.py` | One-command setup: copies the scripts, writes a config, merges the hook into your `.claude/settings.json` without clobbering existing hooks. Idempotent; `--dry-run` supported. |
-| `verify.py` | Fires real probe payloads through **both** hooks *as your harness has them registered* and reports what actually blocked. The answer to "is this thing even running?" `--live` answers the harder half — whether your *harness* has actually invoked the hook, which no probe can prove. Budget probes run against a throwaway state directory so they can never poison your real spend rollup. |
+| `verify.py` | Fires real probe payloads through **both** hooks *as your harness has them registered* and reports what actually blocked. The answer to "is this thing even running?" `--live` answers the harder half — whether your *harness* has actually invoked the hook, which no probe can prove. `--evidence` renders the same facts as a dated artifact you can hand to someone who wasn't there. Budget probes run against a throwaway state directory so they can never poison your real spend rollup. |
 | `gate_guard.py` | The `PreToolUse` hook. Reads the pending tool call on stdin, exits 0 (allow) or 2 (block). |
 | `budget_guard.py` | A second `PreToolUse` hook: blocks when the session's measured token spend crosses a ceiling, or when the agent starts repeating itself. Also runs standalone as a cost reporter. |
 | `approve.py` | The approval queue CLI: file a request, list what's pending, record a human's decision. |
@@ -138,7 +138,7 @@ Narrow them — the config is a JSON file.
 | `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
 | `tests/test_verify.py` | 31 cases. Five deliberately break `budget_guard.py` and assert `verify.py` catches it — a verifier that passes a broken guard is worse than none. |
 | `tests/test_demo.py` | 32 cases running `demo.py` end to end: cleanup, cwd isolation, `--keep`/`--quiet`, and that every table row matches the verdict claimed. |
-| `tests/test_heartbeat.py` | 30 cases covering the liveness heartbeat, caller attribution and `verify.py --live`: that a hook which never fires is distinguishable from one that fires and allows, that an unmarked call is recorded as unattributed rather than assumed to be the main session, that a hostile marker cannot corrupt the file, and that bookkeeping never turns a block into an allow even when the heartbeat is unwritable. |
+| `tests/test_heartbeat.py` | 52 cases covering the liveness heartbeat, caller attribution, `verify.py --live` and `--evidence`: that a hook which never fires is distinguishable from one that fires and allows, that an unmarked call is recorded as unattributed rather than assumed to be the main session, that a hostile marker cannot corrupt the file, that bookkeeping never turns a block into an allow even when the heartbeat is unwritable, and that an evidence report never claims an operating control it cannot evidence. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -366,6 +366,66 @@ is answerable with a four-line settings entry and no install:
 whole bug class, with the open `anthropics/claude-code` reports that document
 it, attributed and dated. It's written to be useful whether or not you ever
 install anything here.
+
+### `--evidence`: the same facts, as something you can hand to someone else
+
+`--live` is for the person who just changed something, and its answer
+evaporates with the scrollback. There is a second question it can't serve:
+**was this control operating across the whole period, and not only at the
+moment somebody checked?**
+
+That distinction is not academic. A config file and a screenshot of a passing
+test are *design* evidence — they show the control was built. What almost
+nobody can produce for an autonomous agent is *operating* evidence: that it
+was actually running, on this machine, between the audits. The heartbeat and
+the blocked-action log already are that evidence. They were just never
+packaged as something portable.
+
+```bash
+python3 verify.py --evidence                      # Markdown to stdout
+python3 verify.py --evidence --format json        # same facts, machine-readable
+python3 verify.py --evidence --out evidence.md    # write it
+```
+
+The report has six sections: what the control is, the window it covers, how
+many tool calls the harness routed through it, what it blocked and when,
+which exact files were running (by SHA-256), and — at equal weight, section
+5 — what none of it proves.
+
+**That last section is the point, not a disclaimer.** An evidence artifact
+that overstates itself is worth less than no artifact, because the first
+competent reader who finds the overstatement stops believing the rest. So the
+report says out loud that its counters are a lower bound, that it is the
+operator's own record and not a third party's, that an absent subagent marker
+proves nothing either way, and that a window with no gaps recorded is not the
+same as a window with no gaps.
+
+It holds the same line `--live` does about what it will claim:
+
+- **It will not report an operating control it cannot evidence.** No
+  heartbeat, or a heartbeat carrying only `verify.py`'s own probes, renders
+  `NOT ESTABLISHED` with the reason named — never a clean-looking report with
+  zeroes in it.
+- **Blocks are not attributed to a window that doesn't exist.** If liveness
+  can't be established, the block log is still shown, labelled `UNATTRIBUTED`,
+  as history of a file rather than evidence of coverage.
+- **`verify.py`'s own probe blocks are excluded** from the enforcement counts.
+  Running the verifier must not inflate the evidence the verifier produces.
+- **The text of blocked commands is held back by default.** It's your command
+  history, and it isn't needed to show the control fired. `--include-attempts`
+  puts it in.
+- **A disagreement between the guard's block counter and the log is printed
+  as a discrepancy**, with the likely causes, rather than silently resolved in
+  favour of whichever number looks better.
+
+The exit code carries the finding — `0` if an operating control was
+evidenced, `1` if the report was produced but says it wasn't — so a nightly
+job fails loudly instead of filing a reassuring artifact.
+
+The report digest is a SHA-256 over the canonicalised JSON form. It detects
+accidental modification and tells you whether two copies are the same report.
+It is not a tamper-proof seal against the operator who generated it, and
+section 5 says so rather than letting the presence of a hash imply otherwise.
 
 ### Budget probes are isolated, and that is not just tidiness
 
@@ -682,7 +742,7 @@ python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
 python3 tests/test_verify.py        # 31 cases, incl. mutation tests on verify.py
 python3 tests/test_demo.py          # 32 cases, front-door demo end to end
-python3 tests/test_heartbeat.py     # 30 cases, liveness heartbeat and --live
+python3 tests/test_heartbeat.py     # 52 cases, liveness, --live and --evidence
 ```
 
 `tests/test_budget_guard.py` concentrates on the cases where a plausible
