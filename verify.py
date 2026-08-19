@@ -44,6 +44,16 @@ probes that should be ALLOWED matter just as much, because an over-blocking
 gate that fights every tool call is a gate you will turn off within a week,
 and then you have no gate at all.
 
+A fourth mode, --over-blocks, follows that thought into your own history
+instead of a probe set. It reads the blocks the gate actually recorded and
+asks, of each one, whether the tool that was blocked could have carried out
+the action the rule exists to stop. Writing a file cannot move funds;
+fetching a URL cannot open an account. Blocks of that shape prevented
+nothing, and their count is the closest thing to an honest price tag on
+running these rules unattended. It is deliberately a floor: anything the
+model does not recognise is reported as not adjudicable rather than counted,
+and the model itself is printed with the result so you can disagree with it.
+
 Probes are derived from the rule ids present in your config. If you replaced
 the default rule pack, probes for rules you removed are reported as SKIP
 rather than counted as failures -- your rules are yours.
@@ -1581,6 +1591,294 @@ def check_evidence(target, max_age_hours, fmt, out_path, include_attempts):
     return 0 if report["body"]["status"]["control_active"] else 1
 
 
+# ---------------------------------------------------------------------------
+# over-block analysis -- what does this gate cost you when you were not doing
+# the thing it exists to stop?
+# ---------------------------------------------------------------------------
+#
+# Every deterministic guardrail in this category blocks on a regex, and a
+# regex has no idea which tool it is looking at. So the interesting question
+# for anyone deciding whether to run one unattended is not "does it block" --
+# it is "how often does it block me for nothing", and nobody publishes that
+# number about their own rules.
+#
+# This is one narrow, machine-decidable slice of that question. It does not
+# read the blocked text and it does not judge intent. It asks only: could the
+# tool that was blocked have carried out the action the rule exists to stop?
+# Writing a file cannot move funds. Fetching a URL cannot create an account.
+# A block of that shape prevented nothing, whatever the text said.
+#
+# The model below is a DECLARATION, not a measurement, so it is printed with
+# the result and is overridable from your gate-guard config -- change it and
+# the number changes, which is the point. Anything it does not recognise is
+# reported as not adjudicable and never counted as an over-block, so the
+# headline is a floor and not an estimate.
+
+# What each tool is physically able to do. A tool absent from this map is
+# unknown, not harmless.
+TOOL_CAPABILITIES = {
+    "Bash": ["exec", "persist"],
+    "BashOutput": ["exec", "persist"],
+    "KillShell": ["exec", "persist"],
+    "Write": ["persist"],
+    "Edit": ["persist"],
+    "MultiEdit": ["persist"],
+    "NotebookEdit": ["persist"],
+    "WebFetch": [],
+    "WebSearch": [],
+    "Read": [],
+    "Grep": [],
+    "Glob": [],
+}
+
+# What the action behind each rule actually requires.
+#   exec    -- must run a command or make a network write to happen at all
+#   persist -- happens as soon as the text lands somewhere it survives
+RULE_REQUIRES = {
+    "FUND_MOVEMENT": "exec",
+    "CONTRACT_DEPLOY": "exec",
+    "PAYMENT_API_WRITE": "exec",
+    "ACCOUNT_SIGNUP_FLOW": "exec",
+    "PACKAGE_INSTALL": "exec",
+    "DOMAIN_REGISTRAR": "exec",
+    "GIT_PUSH_UNAPPROVED": "exec",
+    "KEY_MATERIAL": "persist",
+    "SECRET_IN_COMMAND": "persist",
+    "PROTECTED_FILE": "persist",
+    "PROTECTED_FILE_SHELL": "persist",
+}
+
+
+def capability_model(config):
+    """Merge any declarations from the gate-guard config over the defaults.
+    A project with its own rule ids or a harness with its own tool names can
+    make this analysis apply to it without editing this file."""
+    tools = dict(TOOL_CAPABILITIES)
+    rules = dict(RULE_REQUIRES)
+    overrides = {"tools": [], "rules": []}
+    for key, target, bucket in (("tool_capabilities", tools, "tools"),
+                                ("rule_requires", rules, "rules")):
+        declared = (config or {}).get(key)
+        if isinstance(declared, dict):
+            for name, value in declared.items():
+                overrides[bucket].append(name)
+                target[name] = value
+    return tools, rules, overrides
+
+
+def adjudicate_block(rule, tool, tools, rules):
+    """Return (verdict, reason). The only verdict that accuses the gate of
+    anything is 'over_block', and it is reachable only when both the rule and
+    the tool are declared."""
+    if rule not in rules:
+        return "undeclared_rule", f"no declared requirement for rule {rule}"
+    if tool not in tools:
+        return "undeclared_tool", f"no declared capabilities for tool {tool}"
+    required = rules[rule]
+    if required in (tools[tool] or []):
+        return "capable", f"{tool} can {required}"
+    return "over_block", f"{tool} cannot {required}"
+
+
+def over_block_report(target, log_override=None):
+    """Build the analysis as data. Rendering is separate, so the text and the
+    JSON can never disagree about a number."""
+    generated = datetime.now(timezone.utc)
+    _, command, config, _ = check_wiring(target)
+    path = log_override or project_path(
+        target, command, config, "blocked_log", "approvals/blocked.jsonl")
+    if not path:
+        path = os.path.join(target, "approvals/blocked.jsonl")
+    path = os.path.abspath(path)
+
+    tools, rules, overrides = capability_model(config)
+    log = read_block_log(path, None, None, False)
+
+    counts = {"over_block": 0, "capable": 0,
+              "undeclared_rule": 0, "undeclared_tool": 0}
+    by_pair = {}
+    for event in log["events"]:
+        rule = event.get("rule") or "(none)"
+        tool = event.get("tool") or "(none)"
+        verdict, reason = adjudicate_block(rule, tool, tools, rules)
+        counts[verdict] += 1
+        key = f"{rule}\t{tool}"
+        row = by_pair.setdefault(
+            key, {"rule": rule, "tool": tool, "verdict": verdict,
+                  "reason": reason, "count": 0, "first": None, "last": None})
+        row["count"] += 1
+        ts = event.get("ts")
+        if ts:
+            row["first"] = min(row["first"], ts) if row["first"] else ts
+            row["last"] = max(row["last"], ts) if row["last"] else ts
+
+    total = sum(counts.values())
+    adjudicable = counts["over_block"] + counts["capable"]
+    return {
+        "generated_utc": generated.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "target": target,
+        "log": {"path": path, "present": log["present"],
+                "readable": log["readable"], "lines": log["lines"],
+                "malformed": log["malformed"], "probes_excluded": log["probes"],
+                "first": log["first"], "last": log["last"]},
+        "analysed": total,
+        "counts": counts,
+        "rates": {
+            "over_block_of_adjudicable":
+                round(counts["over_block"] / adjudicable, 4) if adjudicable else None,
+            "over_block_of_all":
+                round(counts["over_block"] / total, 4) if total else None,
+            "adjudicable_of_all":
+                round(adjudicable / total, 4) if total else None,
+        },
+        "pairs": sorted(by_pair.values(),
+                        key=lambda r: (-r["count"], r["rule"], r["tool"])),
+        "model": {"tools": tools, "rules": rules, "overridden": overrides},
+    }
+
+
+def pct(value):
+    return "n/a" if value is None else f"{value * 100:.1f}%"
+
+
+def render_over_blocks(report):
+    L = []
+    add = L.append
+    log = report["log"]
+    add(f"agent-approval-gate: over-block analysis  ({report['generated_utc']})")
+    add(f"  log      {log['path']}")
+
+    if not log["present"]:
+        add("")
+        add("  No blocked-action log at that path. Nothing to analyse -- this "
+            "is not a clean bill of health, it is an absence of data. Point "
+            "--log at your log, or check blocked_log in your gate-guard "
+            "config.")
+        return "\n".join(L) + "\n"
+    if not log["readable"]:
+        add("")
+        add("  The log exists but could not be read. Fix that before trusting "
+            "any number here.")
+        return "\n".join(L) + "\n"
+
+    span = f"{log['first']} .. {log['last']}" if log["first"] else "unknown"
+    add(f"  window   {span}")
+    add(f"  records  {report['analysed']:,} real blocks"
+        + (f", {log['probes_excluded']:,} verify.py probes excluded"
+           if log["probes_excluded"] else "")
+        + (f", {log['malformed']:,} malformed lines skipped"
+           if log["malformed"] else ""))
+
+    if not report["analysed"]:
+        add("")
+        add("  The log is empty of real blocks. Nothing to adjudicate.")
+        return "\n".join(L) + "\n"
+
+    c = report["counts"]
+    r = report["rates"]
+    add("")
+    add("VERDICTS")
+    add(f"  over-block        {c['over_block']:>5}   the blocked tool could "
+        "not have performed the gated action")
+    add(f"  capable           {c['capable']:>5}   the blocked tool could have "
+        "-- says nothing about whether it would")
+    add(f"  rule undeclared   {c['undeclared_rule']:>5}   not adjudicable")
+    add(f"  tool undeclared   {c['undeclared_tool']:>5}   not adjudicable")
+    add("")
+    add(f"  {c['over_block']:,} of {c['over_block'] + c['capable']:,} "
+        f"adjudicable blocks were structurally unnecessary "
+        f"({pct(r['over_block_of_adjudicable'])}).")
+    add(f"  Against the whole log that is {pct(r['over_block_of_all'])}; "
+        f"{pct(r['adjudicable_of_all'])} of records were adjudicable at all.")
+
+    over = [p for p in report["pairs"] if p["verdict"] == "over_block"]
+    if over:
+        add("")
+        add("OVER-BLOCKS BY RULE AND TOOL")
+        for p in over:
+            add(f"  {p['count']:>5}  {p['rule']:<22} {p['tool']:<12} "
+                f"{p['reason']}")
+
+    undeclared = [p for p in report["pairs"]
+                  if p["verdict"].startswith("undeclared")]
+    if undeclared:
+        add("")
+        add("NOT ADJUDICABLE -- declare these to bring them into the count")
+        for p in undeclared:
+            add(f"  {p['count']:>5}  {p['rule']:<22} {p['tool']:<12} "
+                f"{p['reason']}")
+        add("")
+        add("  Add rule_requires / tool_capabilities to your gate-guard "
+            "config. Until then these are excluded from both sides of the "
+            "ratio, not assumed correct.")
+
+    model = report["model"]
+    add("")
+    add("THE MODEL THIS RESTS ON  (declared, not measured -- override it in "
+        "your gate-guard config)")
+    for name, required in sorted(model["rules"].items()):
+        mark = " *" if name in model["overridden"]["rules"] else ""
+        add(f"  rule {name:<24} needs  {required}{mark}")
+    for name, caps in sorted(model["tools"].items()):
+        mark = " *" if name in model["overridden"]["tools"] else ""
+        add(f"  tool {name:<24} can    {', '.join(caps) or '(nothing gated)'}{mark}")
+    if model["overridden"]["rules"] or model["overridden"]["tools"]:
+        add("  * declared by your config, not a default of this tool")
+
+    add("")
+    add("WHAT THIS NUMBER IS NOT")
+    add("  - It is a FLOOR, not the over-block rate. A block on a tool that "
+        "could have done the thing is still very often a false positive -- "
+        "a read-only shell command that merely names a protected file, say. "
+        "This analysis cannot see that and does not try.")
+    add("  - It does not say the remaining blocks were correct. 'Capable' "
+        "means possible, not intended.")
+    add("  - The capability model is a declaration, printed above so you can "
+        "argue with it. If you disagree, override it and rerun; a number you "
+        "cannot change is a number you cannot check.")
+    add("  - It reads only what the log recorded. Actions the gate never saw "
+        "are invisible here, and a gate that never fired produces a "
+        "flawless-looking zero.")
+    add("")
+    return "\n".join(L) + "\n"
+
+
+def check_over_blocks(target, fmt, out_path, log_override, max_rate):
+    report = over_block_report(target, log_override)
+    if fmt == "json":
+        text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    else:
+        text = render_over_blocks(report)
+
+    if out_path:
+        try:
+            directory = os.path.dirname(os.path.abspath(out_path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(out_path, "w") as f:
+                f.write(text)
+        except OSError as e:
+            print(f"could not write {out_path}: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote {out_path}  ({len(text):,} bytes)")
+    else:
+        sys.stdout.write(text)
+
+    # No log and no records are findings, not passes: exiting 0 there would
+    # let "the gate has never run" read the same as "the gate never misfired".
+    if not report["log"]["present"] or not report["log"]["readable"]:
+        return 1
+    if not report["analysed"]:
+        return 1
+    if max_rate is not None:
+        rate = report["rates"]["over_block_of_adjudicable"]
+        if rate is not None and rate * 100 > max_rate:
+            print(f"over-block rate {pct(rate)} exceeds the "
+                  f"{max_rate:.1f}% you allowed", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Verify an installed agent-approval-gate is live and blocking.")
@@ -1601,6 +1899,19 @@ def main():
                          "it covers, what it blocked, which files were "
                          "running, and what none of it proves. Exits 1 if it "
                          "cannot evidence an operating control")
+    ap.add_argument("--over-blocks", action="store_true",
+                    help="Check only what this gate has COST you: how many "
+                         "of its recorded blocks fired on a tool that could "
+                         "not have performed the gated action at all. A "
+                         "floor on the false-positive rate, not an estimate. "
+                         "Exits 1 if there is nothing to analyse, or if the "
+                         "rate exceeds --max-over-block-rate")
+    ap.add_argument("--log", metavar="PATH",
+                    help="With --over-blocks, analyse this blocked-action log "
+                         "instead of the one your gate-guard config names")
+    ap.add_argument("--max-over-block-rate", type=float, metavar="PCT",
+                    help="With --over-blocks, exit 1 if the over-block share "
+                         "of adjudicable blocks exceeds PCT percent")
     ap.add_argument("--format", choices=("md", "json"), default="md",
                     help="With --evidence, the output format (default: md)")
     ap.add_argument("--out", metavar="PATH",
@@ -1612,6 +1923,10 @@ def main():
                          "control fired")
     args = ap.parse_args()
     target = os.path.abspath(args.target)
+
+    if args.over_blocks:
+        return check_over_blocks(target, args.format, args.out, args.log,
+                                 args.max_over_block_rate)
 
     if args.evidence:
         return check_evidence(target, args.max_age, args.format, args.out,
