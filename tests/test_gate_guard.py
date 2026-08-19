@@ -36,6 +36,15 @@ _GIT_PUSH = "git" + " push"
 _RM_VERB = "r" + "m"
 _STATE_FILE = "STATE" + ".json"
 _TOKEN_PREFIX = "gh" + "p_"
+_W_SEED = "see" + "d"
+_W_PHRASE = "phra" + "se"
+_W_WORDS = "wor" + "ds"
+_W_SECRET = "secr" + "et"
+_W_RECOVERY = "recov" + "ery"
+_W_BACKUP = "back" + "up"
+# A well-known public test vector, not a credential: the all-lowest-index
+# BIP-39 vector that ships in wallet test suites. It controls nothing.
+_MNEMONIC = " ".join(["abandon"] * 11 + ["about"])
 
 
 def check(name, condition):
@@ -140,8 +149,96 @@ def main():
             call("Bash", {"command": f"{_PKG_MGR} {_PKG_VERB} left-pad"}, config) is None,
         )
 
+        # KEY_MATERIAL matches the LABEL a wallet prints, not the material.
+        # Vendors do not say "<developer word> phrase": MetaMask prints
+        # "Secret Recovery Phrase", Ledger/Trezor/Coinbase print "recovery
+        # phrase". Before 2026-08-19 the rule knew only the developer's
+        # wording, so every vendor spelling passed. Measured, not assumed:
+        # a payload labelled with the vendor wording was ALLOWED by the
+        # shipped default config.
+        for _label in (
+            _W_RECOVERY + " " + _W_PHRASE,
+            _W_SECRET + " " + _W_RECOVERY + " " + _W_PHRASE,
+            _W_RECOVERY + "-" + _W_PHRASE,
+            _W_SEED + " " + _W_WORDS,
+            _W_BACKUP + " " + _W_PHRASE,
+        ):
+            check(
+                f"key material caught when labelled {_label!r}",
+                call("Write", {"content": f"{_label}: {_MNEMONIC}"}, config) is not None,
+            )
+
+        check(
+            "the original developer wording still matches",
+            call("Write", {"content": f"{_W_SEED} {_W_PHRASE}: {_MNEMONIC}"},
+                 config) is not None,
+        )
+
+        # The limit, pinned so nobody reads the rule as more than it is:
+        # unlabelled material is NOT detected. This is a keyword rule, not
+        # an entropy detector, and README.md says so. If this assertion ever
+        # starts failing, the rule grew a capability the docs deny it has.
+        check(
+            "UNLABELLED material is not detected (documented limit, not a bug)",
+            call("Write", {"content": _MNEMONIC}, config) is None,
+        )
+        check(
+            "ordinary prose containing neither label nor material is allowed",
+            call("Write", {"content": "restore from the backup we took"},
+                 config) is None,
+        )
+
+    _check_internal_error_fails_closed()
+
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
+
+
+def _check_internal_error_fails_closed():
+    """A crash inside the guard must not read as 'allow'.
+
+    Injects a real fault into a real copy of the real file and runs it as the
+    harness would, rather than asserting that a try/except is still present in
+    the source. A static check keeps passing after a refactor removes the
+    behaviour it was meant to protect; this one does not.
+    """
+    import subprocess
+
+    src_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "gate_guard.py")
+    with open(src_path) as f:
+        src = f.read()
+    marker = "def evaluate(payload, config):"
+    if marker not in src:
+        check("internal-error test could locate evaluate() to fault", False)
+        return
+    faulted = src.replace(
+        marker, marker + '\n    raise RuntimeError("injected fault")', 1)
+    payload = json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "echo hi"}})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mutant = os.path.join(tmp, "gate_guard.py")
+        with open(mutant, "w") as f:
+            f.write(faulted)
+
+        def run(config_obj):
+            if config_obj is not None:
+                with open(os.path.join(tmp, "gate-guard.config.json"), "w") as f:
+                    json.dump(config_obj, f)
+            return subprocess.run([sys.executable, mutant], input=payload,
+                                  capture_output=True, text=True, cwd=tmp)
+
+        r = run(None)
+        check("a crash inside the guard exits 2 (fails CLOSED) by default",
+              r.returncode == 2)
+        check("...and says on stderr that it was an internal error, not policy",
+              "INTERNAL ERROR" in r.stderr)
+
+        r = run({"fail_closed_on_internal_error": False})
+        check("...and fails open only when explicitly configured to",
+              r.returncode == 0)
 
 
 if __name__ == "__main__":

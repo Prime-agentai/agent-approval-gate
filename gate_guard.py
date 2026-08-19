@@ -58,15 +58,29 @@ from datetime import datetime, timezone
 
 _W_SEED = "see" + "d"
 _W_PHRASE = "phra" + "se"
+_W_WORDS = "wor" + "ds"
 _W_MNEMONIC = "mne" + "monic"
 _W_PRIVATE = "priv" + "ate"
 _W_SECRET = "secr" + "et"
+_W_RECOVERY = "recov" + "ery"
+_W_BACKUP = "back" + "up"
 _W_KEY = "ke" + "y"
 _F_KEYPAIR = "keypair" + r"\.json"
 _F_ID = "id" + r"\.json"
 
+# The label words a wallet actually prints next to this material. Vendor
+# wording is not "see"+"d phrase" -- MetaMask says "Secret Recovery Phrase",
+# Ledger and Trezor say "recovery phrase", Coinbase says "recovery phrase".
+# A rule that only knew the developer's word for it would miss every one of
+# them, which is the failure this list exists to prevent. See the limits
+# section in README.md: this matches the LABEL, never the material itself.
+_LABELLED_PHRASE = (
+    r"(" + _W_SEED + "|" + _W_RECOVERY + "|" + _W_BACKUP + r")"
+    r"[\s_-]?(" + _W_PHRASE + "|" + _W_WORDS + r")"
+)
+
 KEY_MATERIAL_PATTERN = (
-    r"\b(" + _W_SEED + r"[\s_-]?" + _W_PHRASE + "|" + _W_MNEMONIC +
+    r"\b(" + _LABELLED_PHRASE + "|" + _W_MNEMONIC +
     "|" + _W_PRIVATE + r"[\s_-]?" + _W_KEY + "|" + _W_SECRET +
     r"[\s_-]?" + _W_KEY + "|" + _F_KEYPAIR + "|" + _F_ID + r")\b"
 )
@@ -608,10 +622,40 @@ def main():
     except Exception:
         sys.exit(0)  # Malformed hook input is not the agent's doing.
 
-    config = load_config()
-    hit, tool_name, text, tier = evaluate(payload, config)
-    record_heartbeat(config, payload, tool_name, "block" if hit else "allow",
-                     hit[0] if hit else None)
+    # Everything from here on is this guard's own logic, and a bug in it must
+    # not be able to quietly wave a gated call through. Under Claude Code's
+    # PreToolUse contract only 0 (allow) and 2 (block) are meaningful; every
+    # other exit status -- including the 1 that an unhandled Python exception
+    # produces -- is treated as a non-blocking error and THE TOOL CALL RUNS.
+    # So the default here is to fail closed: a guard that cannot decide is
+    # treated as a guard that said no. That is a deliberate trade against the
+    # lockout risk documented in docs/hook-not-firing.md, and it is the one a
+    # security control should take. Set fail_closed_on_internal_error to false
+    # if you would rather a broken guard let work continue.
+    try:
+        config = load_config()
+        hit, tool_name, text, tier = evaluate(payload, config)
+        record_heartbeat(config, payload, tool_name, "block" if hit else "allow",
+                         hit[0] if hit else None)
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        fail_closed = True
+        try:
+            fail_closed = bool(load_config().get(
+                "fail_closed_on_internal_error", True))
+        except BaseException:
+            pass
+        print(
+            f"gate_guard: INTERNAL ERROR in the approval gate itself: "
+            f"{type(exc).__name__}: {exc}\n"
+            f"This is not a policy decision -- the guard could not reach one. "
+            f"{'Failing CLOSED (call blocked).' if fail_closed else 'Failing OPEN (call allowed).'}\n"
+            f"Fix the guard before relying on it; a hook that cannot run is a "
+            f"hook that is not protecting anything.",
+            file=sys.stderr,
+        )
+        sys.exit(2 if fail_closed else 0)
 
     if not hit:
         sys.exit(0)

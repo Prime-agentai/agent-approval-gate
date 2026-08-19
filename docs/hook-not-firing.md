@@ -157,7 +157,66 @@ whole session. Before assuming a harness bug, prove your matcher fires by
 temporarily replacing it with `*` and re-running the Option A heartbeat. If `*`
 leaves lines and your specific matcher doesn't, the problem is the matcher.
 
-### 6. Subagents
+### 6. The hook command cannot start — and which half you broke decides the outcome
+
+This is the cause most likely to be missed, because one of its two forms is
+completely silent.
+
+[#80697](https://github.com/anthropics/claude-code/issues/80697) (open,
+`documentation`, read live 2026-08-19) began as a report that a hook which
+*fails to launch* is treated as a deliberate deny: CPython exits **2** when it
+cannot open the target script, and 2 is exactly the hook protocol's "block"
+signal, so a path typo becomes an unrecoverable tool lockout. A maintainer
+reproduced it on 2.1.233 and confirmed it is working as documented — the hook
+*process* (`python`) starts fine, and Python's own exit 2 is then a normal
+executed-command result. The reporter agreed and narrowed the claim.
+
+The important part came next, and it is not ours — it was measured in that
+thread on 2026-08-19 by another agent operator, on 2.1.226/Windows 11:
+
+| what is broken in `command` | outcome |
+|---|---|
+| the **script path** (`python C:/nope/ghost.py`) — interpreter resolves | exit 2 → tool **blocked**, loudly |
+| the **executable** (`ghostinterp_zz C:/nope/ghost.py`) | hook never runs → tool **executes** |
+
+**Same class of operator mistake — a path that no longer resolves — opposite
+policy outcome, decided by which half of the command string broke.**
+
+For a guard, the second row is far worse than the first. A lockout announces
+itself within thirty seconds. A guard that silently stopped existing can run
+for weeks while every tool call succeeds: an unresolved environment variable
+in the interpreter path, a moved virtualenv, a renamed wrapper. Nothing in the
+transcript says the gate is gone.
+
+**This is precisely what the heartbeat above is for**, and it is the reason
+this guide leads with "prove it ran" rather than "check your config". A config
+file cannot tell you the interpreter still resolves on the machine and account
+the harness actually spawns. Only a line appearing in the heartbeat can.
+
+Two things follow for anyone writing a hardening hook, both worth doing today:
+
+1. **Decide what your own crash means, and encode it — don't inherit it.**
+   Be careful with the advice "exit a code the protocol doesn't own": that
+   works for a dashboard with its own signal map, but **under Claude Code's
+   `PreToolUse` contract only `0` and `2` are meaningful, and every other exit
+   status is a non-blocking error — so a novel code fails *open*.** An
+   unhandled exception in Python exits 1 and therefore lets the tool call
+   through. If you are writing a hardening hook, catch your own exceptions at
+   the top level and exit **2** deliberately, so that a broken guard locks up
+   instead of waving traffic past. That is a real trade — it is the lockout
+   from the top of this section — which is exactly why it should be a
+   decision in your code and a line in your config, not a default you got by
+   accident. `gate_guard.py` does this as of v0.6.0 and lets you flip it.
+2. **Test it by injecting a real crash into the real registered file**, not by
+   asserting a `try`/`except` is still present in source. Static checks pass
+   happily after a refactor deletes the behaviour they were guarding.
+
+There is an open design question in that thread that nobody has answered and
+that we think is the right one to press: *is fail-open the intended contract
+when a configured hook cannot start?* A formatting hook and a security hook
+want opposite defaults, and today they get the same one.
+
+### 7. Subagents
 
 [#86405](https://github.com/anthropics/claude-code/issues/86405) reports hooks
 not firing for subagent tool calls. If your threat model includes delegated

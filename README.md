@@ -798,6 +798,7 @@ All three scripts share one config file. See
 | `immutable_fields` | `state.py` | Top-level state fields the script refuses to write |
 | `ledger_path` | `state.py` | Where `revenue` entries are appended |
 | `trust_threshold_usd` | `state.py` | Optional: prints an eligibility notice past this cumulative verified amount (does not auto-promote) |
+| `fail_closed_on_internal_error` | `gate_guard.py` | Default `true`. If the guard itself raises, exit `2` (block) rather than letting Python's exit `1` read as a non-blocking error and pass the call through. Set `false` to prefer availability over enforcement — see [docs/hook-not-firing.md](docs/hook-not-firing.md) §6 for the trade |
 | `rule_requires` | `verify.py --over-blocks` | Optional: `{"YOUR_RULE": "exec"\|"persist"}` — what the action behind each of your rules needs in order to happen. Merges over the defaults; undeclared rules are excluded from the analysis, not assumed correct |
 | `tool_capabilities` | `verify.py --over-blocks` | Optional: `{"YourTool": ["exec", "persist"]}` — what each tool your harness exposes is physically able to do. `[]` means it can do neither. Undeclared tools are excluded, not assumed harmless |
 
@@ -907,6 +908,31 @@ relying on it.
   reach production billing, no hook fully closes that gap — the token itself
   is the boundary of last resort. Scope credentials first; use this to catch
   what scoping alone doesn't.
+- **`KEY_MATERIAL` matches the label, never the material.** It fires on the
+  words that appear *next to* offline signing material — the wording wallet
+  vendors print as well as the wording developers use — and it has no idea
+  what the material itself looks like. Paste twelve unlabelled words and it
+  will not fire, by construction. A test asserts exactly that, so the limit
+  cannot quietly disappear. If you need unlabelled material detected, you
+  need an entropy/format checker, which this is not.
+
+### A correction we shipped, because it is the useful kind
+
+Until 2026-08-19 that rule knew only the *developer's* vocabulary for this
+material. It did not know the words a wallet actually puts on the screen —
+MetaMask, Ledger, Trezor and Coinbase all label it "recovery phrase", with
+MetaMask prefixing "Secret". Measured against the shipped default config, a
+payload using the vendor wording was **allowed**: a rule documented as
+permanent and absolute, passing the exact phrasing a user is most likely to
+paste, because whoever wrote it (us) reached for jargon instead of checking
+what the screen says.
+
+Fixed in v0.6.0 — the rule now covers recovery/backup/seed × phrase/words,
+with five tests pinning the vendor spellings and one pinning the unlabelled
+limit above. **The general lesson is worth more than the patch: a keyword
+rule inherits the vocabulary of whoever wrote it.** If you run your own rule
+pack, the question to ask each rule is not "is this correct?" but "whose
+words are these, and whose words are missing?"
 
 ## Contributing
 
