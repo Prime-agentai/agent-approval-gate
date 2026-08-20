@@ -171,16 +171,39 @@ reproduced it on 2.1.233 and confirmed it is working as documented — the hook
 *process* (`python`) starts fine, and Python's own exit 2 is then a normal
 executed-command result. The reporter agreed and narrowed the claim.
 
-The important part came next, and it is not ours — it was measured in that
-thread on 2026-08-19 by another agent operator, on 2.1.226/Windows 11:
+The important part came next, and the first two rows below are not ours — they
+were measured in that thread on 2026-08-19 by another agent operator, on
+2.1.226/Windows 11. We replicated both on 2.1.226/Linux on 2026-08-20 and
+added the third.
 
-| what is broken in `command` | outcome |
-|---|---|
-| the **script path** (`python C:/nope/ghost.py`) — interpreter resolves | exit 2 → tool **blocked**, loudly |
-| the **executable** (`ghostinterp_zz C:/nope/ghost.py`) | hook never runs → tool **executes** |
+Each hook script below appends a line to a log file before doing anything
+else, so "did the hook actually run" is measured rather than inferred. Minimal
+setup in an empty directory: `--setting-sources project --strict-mcp-config`,
+matcher `Bash`.
+
+| what is broken in `command` | hook ran? | measured outcome |
+|---|---|---|
+| the **script path** (`python3 /nope/ghost.py`) — interpreter resolves | no | exit 2 → tool **blocked**, loudly |
+| the **executable** (`ghostinterp_zz /nope/ghost.py`) | no | hook never runs → tool **executes** |
+| **nothing is misconfigured** — the hook launches, runs, then raises | **yes** | exit 1 → tool **executes** |
+| *(control)* the hook runs and calls `sys.exit(2)` | yes | exit 2 → tool **blocked** |
 
 **Same class of operator mistake — a path that no longer resolves — opposite
 policy outcome, decided by which half of the command string broke.**
+
+**The third row is a different animal and it is the one to watch.** Rows one
+and two are *configuration* faults: they live in `settings.json`, they are
+permanent once introduced, and they are visible to anyone who looks. Row three
+is a *runtime* fault in a hook that is correctly configured and demonstrably
+running — the log line proves it ran — which then throws on something its
+author did not anticipate: a payload shape the matcher did not predict, an
+unreadable config file, a `KeyError` on a field that used to be there. CPython
+exits **1** for any unhandled exception, 1 is a non-blocking error, and the
+tool call proceeds. Rows three and four differ *only* in the hook's exit code.
+
+No amount of path-checking finds row three, it is intermittent by nature — only
+the payloads that hit the bug — and it fails in the direction that does not
+complain. This one is ours: we had it, in this repo, until v0.6.0.
 
 For a guard, the second row is far worse than the first. A lockout announces
 itself within thirty seconds. A guard that silently stopped existing can run
