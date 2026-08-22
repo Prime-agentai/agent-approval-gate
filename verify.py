@@ -1238,6 +1238,14 @@ def evidence_report(target, max_age_hours, include_attempts=False):
     generated = datetime.now(timezone.utc)
     facts = liveness_facts(target, max_age_hours)
     hb = facts["hb"] or {}
+    # Whether the guard's own counters were readable at all. When the heartbeat
+    # is absent, disabled or unparseable there is no counter to report -- and
+    # reporting the 0 that `hb.get(...) or 0` yields would state, in the summary
+    # table, that this gate has never blocked anything. On a project whose block
+    # log holds hundreds of records that is simply a false sentence, and it is
+    # the sentence a reader who only reads section 1 walks away with. Unknown
+    # and zero are different findings; the renderers below keep them apart.
+    counters_known = facts["hb"] is not None
     config = facts["config"] or {}
     command = facts["command"]
 
@@ -1302,9 +1310,13 @@ def evidence_report(target, max_age_hours, include_attempts=False):
             "stale_after_hours": max_age_hours,
         },
         "activity": {
-            "harness_invocations": facts["invocations"],
-            "verify_probe_invocations": facts["probes"],
-            "blocks_recorded_by_guard": hb.get("blocks") or 0,
+            # null, not 0, when the heartbeat could not be read: see
+            # counters_known above. A consumer testing `== 0` would otherwise
+            # read "never fired" out of "never measured".
+            "counters_known": counters_known,
+            "harness_invocations": facts["invocations"] if counters_known else None,
+            "verify_probe_invocations": facts["probes"] if counters_known else None,
+            "blocks_recorded_by_guard": (hb.get("blocks") or 0) if counters_known else None,
             "last_tool": hb.get("last_tool"),
             "last_decision": hb.get("last_decision"),
             "last_rule": hb.get("last_rule"),
@@ -1380,13 +1392,28 @@ def render_evidence_markdown(report):
         add(f"| Evidence window | {w['first_invocation']} → {w['last_invocation']} |")
         add(f"| Window length | {w['human']} |")
     a = b["activity"]
-    add(f"| Tool calls the harness routed through the gate | {a['harness_invocations']:,} |")
-    add(f"| Calls blocked by the gate | {a['blocks_recorded_by_guard']:,} |")
+    e0 = b["enforcement"]
+    if a["counters_known"]:
+        add(f"| Tool calls the harness routed through the gate | "
+            f"{a['harness_invocations']:,} |")
+        add(f"| Calls blocked by the gate | {a['blocks_recorded_by_guard']:,} |")
+    else:
+        # The counters live in the heartbeat, and there isn't one. Both rows
+        # would print 0, and a summary-only reader would take that as "this
+        # gate has never stopped anything" -- when the block log two sections
+        # down may hold hundreds of records. Point at the log instead of
+        # printing a zero we cannot stand behind.
+        add("| Tool calls the harness routed through the gate | unknown — no "
+            "heartbeat to count them, see §2 |")
+        logged = e0["lines"] if (e0["present"] and e0["readable"]) else None
+        add("| Calls blocked by the gate | unknown — no heartbeat counter"
+            + (f"; {logged:,} record(s) in the block log, see §4" if logged
+               else "")
+            + " |")
     # Without the log there is nothing to count rules from. Printing 0 would
     # read as "no rule ever fired", which is a different claim from "the
     # per-rule breakdown is unavailable" -- and the block count above may well
     # be non-zero.
-    e0 = b["enforcement"]
     if not (e0["present"] and e0["readable"]):
         add("| Distinct rules that fired | unavailable — no readable "
             "blocked-action log |")
@@ -1453,9 +1480,18 @@ def render_evidence_markdown(report):
     add("")
     e = b["enforcement"]
     if not e["present"]:
-        add(f"No blocked-action log at `{e['path']}`. The guard records block "
-            "counts in the heartbeat regardless, so section 1's block count "
-            "still stands; the per-event detail below is unavailable.")
+        if b["activity"]["counters_known"]:
+            add(f"No blocked-action log at `{e['path']}`. The guard records "
+                "block counts in the heartbeat regardless, so section 1's "
+                "block count still stands; the per-event detail below is "
+                "unavailable.")
+        else:
+            # Neither source exists. The old wording sent the reader back to a
+            # section 1 count that is itself unknown, which reads as a
+            # corroboration between two absences.
+            add(f"No blocked-action log at `{e['path']}`, and no heartbeat "
+                "counter either (section 2). This report can say nothing "
+                "about whether the gate has ever blocked anything.")
     elif not e["readable"]:
         add(f"`{e['path']}` exists but could not be read.")
     else:
@@ -1505,7 +1541,11 @@ def render_evidence_markdown(report):
                     "needed to evidence that the control fired. Re-run with "
                     "`--include-attempts` to include it._")
                 add("")
-        if e["in_window"] != b["activity"]["blocks_recorded_by_guard"]:
+        # Only a discrepancy if there are two numbers to disagree. With no
+        # heartbeat there is one source, not two, and calling that a
+        # discrepancy would invent a conflict out of a missing file.
+        if (b["activity"]["counters_known"]
+                and e["in_window"] != b["activity"]["blocks_recorded_by_guard"]):
             add(f"> **Note a discrepancy rather than hiding it:** the guard's "
                 f"own counter says {b['activity']['blocks_recorded_by_guard']:,} "
                 f"block(s); this log yields {e['in_window']:,} in-window "

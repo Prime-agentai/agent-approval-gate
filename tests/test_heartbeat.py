@@ -494,6 +494,81 @@ class EvidenceReportTests(unittest.TestCase):
             self.assertIn("NOT ESTABLISHED", md)
             self.assertNotIn("| Control status at report time | **ACTIVE** |", md)
 
+    def test_a_missing_heartbeat_does_not_report_zero_blocks(self):
+        # Found by running --evidence against a real project: the summary read
+        # "Calls blocked by the gate | 0" while section 4 of the same report
+        # listed 224 blocks, the most recent four minutes earlier. Both
+        # counters live in the heartbeat, and there wasn't one -- so 0 was the
+        # default, not a measurement. A reader who stops after section 1, which
+        # is what a summary is for, walks away with a false sentence.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)  # deliberately no heartbeat
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            now = datetime.now(timezone.utc).isoformat()
+            with open(log, "w") as f:
+                for _ in range(3):
+                    f.write(json.dumps({"ts": now, "rule": "FUND_MOVEMENT",
+                                        "tool": "Bash",
+                                        "attempted": _FUND_MOVE}) + "\n")
+            body = self.report(tmp)["body"]
+            self.assertFalse(body["activity"]["counters_known"])
+            # null, not 0 -- a consumer testing `== 0` must not read "never
+            # fired" out of "never measured".
+            self.assertIsNone(body["activity"]["blocks_recorded_by_guard"])
+            self.assertIsNone(body["activity"]["harness_invocations"])
+
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertNotIn("| Calls blocked by the gate | 0 |", md)
+            self.assertNotIn(
+                "| Tool calls the harness routed through the gate | 0 |", md)
+            # and it sends the reader to the records that do exist
+            self.assertIn("3 record(s) in the block log", md)
+
+    def test_a_present_heartbeat_still_reports_a_true_zero(self):
+        # The guard against overcorrecting the test above. A heartbeat that has
+        # been written and says zero blocks is a measurement, and "0" is the
+        # honest rendering of it. Only an absent counter becomes "unknown".
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            write_heartbeat(tmp, blocks=0)
+            body = self.report(tmp)["body"]
+            self.assertTrue(body["activity"]["counters_known"])
+            self.assertEqual(body["activity"]["blocks_recorded_by_guard"], 0)
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertIn("| Calls blocked by the gate | 0 |", md)
+
+    def test_with_neither_source_the_report_claims_nothing(self):
+        # Section 4's no-log branch used to reassure the reader that "section
+        # 1's block count still stands". With no heartbeat either, that sent
+        # them back to a number which is itself unknown -- two absences reading
+        # as if they corroborated each other.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            if os.path.exists(log):
+                os.remove(log)
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertNotIn("section 1's block count still stands", md)
+            self.assertIn("can say nothing about whether the gate has ever "
+                          "blocked anything", md)
+
+    def test_no_discrepancy_note_when_there_is_only_one_source(self):
+        # The discrepancy note compares the heartbeat counter against the log.
+        # With no heartbeat there is one source, not two, and reporting a
+        # conflict would manufacture one out of a missing file.
+        with tempfile.TemporaryDirectory() as tmp:
+            project(tmp)
+            log = os.path.join(tmp, "approvals", "blocked.jsonl")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "w") as f:
+                f.write(json.dumps(
+                    {"ts": datetime.now(timezone.utc).isoformat(),
+                     "rule": "FUND_MOVEMENT", "tool": "Bash",
+                     "attempted": _FUND_MOVE}) + "\n")
+            md = verify.render_evidence_markdown(self.report(tmp))
+            self.assertNotIn("Note a discrepancy", md)
+
     def test_never_claims_active_on_probe_invocations_alone(self):
         # verify.py's own probes prove the script runs and prove nothing about
         # the harness. An artifact built only from them evidences nothing.
