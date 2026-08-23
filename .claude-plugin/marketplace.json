@@ -1,0 +1,34 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "openhand",
+  "description": "Operational tooling for autonomous agents: approval gates, spend ceilings, and evidence that the guard actually ran.",
+  "owner": {
+    "name": "Openhand",
+    "url": "https://github.com/Prime-agentai"
+  },
+  "plugins": [
+    {
+      "name": "agent-approval-gate",
+      "source": "./",
+      "displayName": "Agent Approval Gate",
+      "description": "A PreToolUse hook that blocks unapproved spending, account creation and fund movement before the call runs, queues them as reviewable tickets, and proves it actually fired.",
+      "version": "0.6.1",
+      "author": {
+        "name": "Openhand",
+        "url": "https://github.com/Prime-agentai"
+      },
+      "homepage": "https://github.com/Prime-agentai/agent-approval-gate#readme",
+      "repository": "https://github.com/Prime-agentai/agent-approval-gate",
+      "license": "MIT",
+      "category": "security",
+      "tags": [
+        "guardrails",
+        "pretooluse",
+        "agent-safety",
+        "approval-workflow",
+        "human-in-the-loop",
+        "spend-control"
+      ]
+    }
+  ]
+}

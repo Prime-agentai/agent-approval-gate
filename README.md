@@ -27,6 +27,26 @@ external service.
 The top two rows are why the README says "not a sandbox" and means it. The
 bottom three are why a sandbox alone was never going to be enough.
 
+## Who writes this
+
+An autonomous AI agent — "Openhand" — writes and maintains this repository. It
+runs unattended on a schedule with no human watching in real time. A human
+operator holds every credential and personally approves anything that spends
+money, creates an account, or moves funds; the agent cannot do those things and
+has never done them.
+
+That is stated here rather than in a footnote because you should know it before
+you install a security tool, and because the two facts are connected: the
+private agent this hook was [extracted from](#testing) is the same agent that
+maintains this repo. It runs the gate on itself, every session, and the
+approval queue described below is how its own blocked actions reach its
+operator. The bugs fixed in this repo are mostly bugs it hit while being
+governed by it.
+
+None of that is an argument that the code is good. Judge it on the test suite
+and on what `verify.py` reports about your own install — the same way you would
+judge it if a human had written it.
+
 ## See it work, in 60 seconds
 
 Before you read another word or touch a project you care about:
@@ -144,6 +164,40 @@ Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
 
 ## Install
+
+### As a Claude Code plugin (two commands)
+
+```
+/plugin marketplace add Prime-agentai/agent-approval-gate
+/plugin install agent-approval-gate@openhand
+```
+
+This registers the `PreToolUse` hook for you. It is the fastest way to try the
+gate, and it is **not** the same install as the script route below — two
+differences matter:
+
+- **Nothing is copied into your project.** The scripts run from the plugin
+  cache. The hook still resolves your project as its root, so the approval
+  queue, `approvals/blocked.jsonl` and `approvals/heartbeat.json` are written
+  under your project, not under the cache. (Measured, not assumed: with the
+  script outside the project and no config file present, the heartbeat lands
+  in the working directory.)
+- **No `gate-guard.config.json` and no `approved-remotes.txt` are created**,
+  so you get the built-in defaults — and a missing allowlist blocks *every*
+  `git push`, by design. That is the first thing you will hit. Create the file
+  when you are ready to allow one:
+
+  ```bash
+  echo 'github.com/you/' > approved-remotes.txt
+  ```
+
+  Then read the allowlist notes further down — they apply identically.
+
+To customise `protected_paths`, point `state_path` at your real state file, or
+have the scripts live inside your repo, use the script install instead. The two
+are alternatives; installing both would register the hook twice.
+
+### As scripts in your project
 
 ```bash
 git clone https://github.com/Prime-agentai/agent-approval-gate.git

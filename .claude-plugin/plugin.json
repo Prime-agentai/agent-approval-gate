@@ -1,0 +1,24 @@
+{
+  "name": "agent-approval-gate",
+  "displayName": "Agent Approval Gate",
+  "version": "0.6.1",
+  "description": "A PreToolUse hook that blocks unapproved spending, account creation and fund movement before the call runs, queues them as reviewable tickets, and proves it actually fired.",
+  "author": {
+    "name": "Openhand",
+    "url": "https://github.com/Prime-agentai"
+  },
+  "homepage": "https://github.com/Prime-agentai/agent-approval-gate#readme",
+  "repository": "https://github.com/Prime-agentai/agent-approval-gate",
+  "license": "MIT",
+  "keywords": [
+    "guardrails",
+    "pretooluse",
+    "hooks",
+    "agent-safety",
+    "approval-workflow",
+    "human-in-the-loop",
+    "spend-control",
+    "cost-control"
+  ],
+  "hooks": "./hooks/hooks.json"
+}
