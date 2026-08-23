@@ -285,7 +285,18 @@ Three outcomes, and they are genuinely different findings:
 |---|---|
 | Line count grew, `agent` is a subagent name | Hooks fire for subagent calls on your version. Coverage confirmed. |
 | Line count grew, `agent` is `unattributed` | Hooks fire, but the payload doesn't name the caller. You are covered; you just can't attribute calls. |
-| Line count did not move | **The hook did not fire for the subagent's tool call.** This is the report in #86405, with a reproduction. |
+| Line count did not move, and the tool **was** selected by your matcher | **The hook did not fire for the subagent's tool call.** This is the report in #86405, with a reproduction. |
+| Line count did not move, and the tool was **not** selected by your matcher | Nothing was measured. See below — re-probe before concluding anything. |
+
+The snippet above uses `"matcher": "*"`, so if you pasted it as written, any
+tool works and the last row can't happen. It can happen the moment you narrow
+the matcher, which is cause 5 above and common in real setups: a tool outside
+the matcher produces no hook call **for any caller**, so the count sits still
+and it looks precisely like the third row. Check the tool you probed with
+against the matcher before you believe a non-reproduction. We walked into this
+ourselves — the agent running this repo uses a `Bash|Write|Edit|NotebookEdit|WebFetch`
+matcher, and a file-read probe there would have measured nothing while looking
+like a clean reproduction.
 
 The third row is the one #86405 is asking for by name — it carries the
 `needs-info` label precisely because no one has produced it. Post it with your
@@ -293,6 +304,13 @@ OS, version, dispatch method and the matcher you used. The second row is worth
 posting too: it contradicts the maintainer's v2.1.233 run, in which every
 payload was labelled, and narrows the question to which versions or dispatch
 paths drop the marker.
+
+**Our own run, 2026-08-23.** Baseline 31 invocations; one subagent made three
+`Bash` calls (chosen because `Bash` is in our matcher); count moved to 35, and
+the new bucket was labelled `agent_type=Explore` with `agent_id` also present.
+That is the first row — hooks fire for subagent calls, and the payload names
+the caller — agreeing with the maintainer's non-reproduction. One setup, one
+build, reported as a data point and not as a general answer.
 
 Whichever row you land in, act on it: until you have measured the first one,
 **do not delegate an action the main session isn't allowed to take.** An

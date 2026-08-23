@@ -329,5 +329,84 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("configured 0.5x rate", result.stdout)
 
 
+class HookMatcherTests(unittest.TestCase):
+    """The matcher decides which tools ever reach the guard.
+
+    These exist because the subagent-coverage procedure told operators to
+    probe with "a file read", which on a narrowed matcher generates no hook
+    call at all and reads as a harness bug that isn't there.
+    """
+
+    def setUp(self):
+        self.target = tempfile.mkdtemp(prefix="verify-matcher-")
+        self.addCleanup(shutil.rmtree, self.target, ignore_errors=True)
+        os.makedirs(os.path.join(self.target, ".claude"))
+
+    def write_entries(self, entries):
+        path = os.path.join(self.target, ".claude", "settings.json")
+        with open(path, "w") as f:
+            json.dump({"hooks": {"PreToolUse": entries}}, f)
+
+    def entry(self, command, matcher=None):
+        e = {"hooks": [{"type": "command", "command": command}]}
+        if matcher is not None:
+            e["matcher"] = matcher
+        return e
+
+    def test_absent_matcher_key_means_everything(self):
+        self.write_entries([self.entry("python3 /p/gate_guard.py")])
+        self.assertEqual(verify.find_hook_matcher(self.target), "*")
+
+    def test_narrowed_matcher_is_returned_verbatim(self):
+        self.write_entries([
+            self.entry("python3 /p/gate_guard.py", "Bash|Write|Edit")])
+        self.assertEqual(
+            verify.find_hook_matcher(self.target), "Bash|Write|Edit")
+
+    def test_matcher_comes_from_the_entry_registering_this_guard(self):
+        self.write_entries([
+            self.entry("python3 /p/other_hook.py", "*"),
+            self.entry("python3 /p/gate_guard.py", "Bash"),
+        ])
+        self.assertEqual(verify.find_hook_matcher(self.target), "Bash")
+
+    def test_unreadable_settings_is_unknown_not_a_warning(self):
+        self.assertIsNone(verify.find_hook_matcher(self.target))
+        # Unknown must not fire the warning: noise on a healthy install.
+        self.assertTrue(verify.matcher_covers_everything(None))
+
+    def test_covers_everything(self):
+        for m in ("*", "", "  ", None):
+            self.assertTrue(verify.matcher_covers_everything(m), m)
+        for m in ("Bash", "Bash|Write", "Edit|Write"):
+            self.assertFalse(verify.matcher_covers_everything(m), m)
+
+
+class SubagentRowMatcherTests(unittest.TestCase):
+    UNPROVEN = {"identity": {"agents": {}, "subagent_coverage": "unproven"}}
+    OBSERVED = {"identity": {
+        "agents": {"agent_type=Explore": {"invocations": 3, "subagent": True}},
+        "subagent_coverage": "observed"}}
+
+    def test_narrowed_matcher_is_named_in_the_warning(self):
+        status, _, detail = verify.subagent_row(self.UNPROVEN, "Bash|Write")
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("Bash|Write", detail)
+
+    def test_wildcard_matcher_adds_no_noise(self):
+        _, _, detail = verify.subagent_row(self.UNPROVEN, "*")
+        self.assertNotIn("matcher", detail)
+
+    def test_unknown_matcher_adds_no_noise(self):
+        _, _, detail = verify.subagent_row(self.UNPROVEN, None)
+        self.assertNotIn("matcher", detail)
+
+    def test_observed_still_passes_regardless_of_matcher(self):
+        status, _, detail = verify.subagent_row(self.OBSERVED, "Bash")
+        self.assertEqual(status, verify.PASS)
+        self.assertIn("agent_type=Explore", detail)
+        self.assertNotIn("matcher", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -349,6 +349,29 @@ So the heartbeat records **who** the harness said was calling, from
   call, re-run. If the count doesn't move, the hook is not firing for subagent
   calls and you have a reproduction for #86405.
 
+**Probe with a tool your matcher covers.** The installer registers
+`"matcher": "*"`, and on that default any tool works. If you have narrowed the
+matcher — `Bash|Write|Edit` and similar are common, and are cause 5 in
+[`docs/hook-not-firing.md`](docs/hook-not-firing.md) — then a tool outside it
+generates *no hook call for any caller*, main session included. The count
+doesn't move, and that looks exactly like the harness failing to fire for
+subagents when nothing is wrong at all. `--live` now reads the matcher off the
+same settings entry that registered the guard and names it in the warning, and
+the procedure calls this out as case (d). We added it after walking into it:
+the old text suggested "a file read is enough", and `Read` is outside the
+matcher this repo's own agent runs. A false report of #86405 is worse than
+silence, because it buries the real ones.
+
+**First measured result, 2026-08-23 (this project's own setup).** Baseline 31
+invocations; one subagent made three `Bash` calls; the count moved to 35 and a
+labelled bucket appeared: `observed: agent_type=Explore (3 calls)`, with
+`agent_id` and `agent_type` both present in the payload. So on this setup, on
+this build, the hook does fire for subagent tool calls and the harness does
+label them — an independent second data point agreeing with the maintainer's
+non-reproduction on #86405. It is one setup, not a general claim about all
+builds, and it says nothing about anyone else's install. Reproduce it on yours
+rather than trusting ours; that is the entire point of the check.
+
 It never reports "main session only." A payload carrying no agent marker is
 equally consistent with a harness that fires the hook for subagents without
 labelling them, and calling that "covered" would be inventing a result. This

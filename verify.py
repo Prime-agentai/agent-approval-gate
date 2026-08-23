@@ -189,21 +189,23 @@ def build_probes(config, state_abspath):
     ]
 
 
-def find_hook_command(target, marker="gate_guard.py"):
-    """Pull the registered hook command straight out of settings.json. Testing
-    anything else would be testing a hook your harness isn't running.
+def _hook_entry(target, marker="gate_guard.py"):
+    """The PreToolUse entry registering `marker`, as (entry, command, err).
 
-    `marker` is the guard's script filename; both guards register their own
-    PreToolUse entry and are recognised by it.
+    Split out of find_hook_command so callers can also read the *matcher*.
+    Reading the command while discarding the matcher is exactly how a narrowed
+    matcher gets misdiagnosed as a harness bug: the matcher decides which tools
+    ever reach the guard at all, and no amount of correct guard code makes a
+    tool outside it produce a hook call.
     """
     settings_path = os.path.join(target, ".claude", "settings.json")
     if not os.path.isfile(settings_path):
-        return None, f"{settings_path} does not exist"
+        return None, None, f"{settings_path} does not exist"
     try:
         with open(settings_path) as f:
             settings = json.load(f)
     except json.JSONDecodeError as e:
-        return None, f"settings.json is not valid JSON: {e}"
+        return None, None, f"settings.json is not valid JSON: {e}"
 
     variants = (marker, marker.replace("_", "-"))
     pre = (settings.get("hooks") or {}).get("PreToolUse") or []
@@ -211,8 +213,44 @@ def find_hook_command(target, marker="gate_guard.py"):
         for hook in entry.get("hooks", []) or []:
             cmd = str(hook.get("command", ""))
             if any(v in cmd for v in variants):
-                return cmd, None
-    return None, f"no PreToolUse hook referencing {marker} is registered"
+                return entry, cmd, None
+    return None, None, f"no PreToolUse hook referencing {marker} is registered"
+
+
+def find_hook_command(target, marker="gate_guard.py"):
+    """Pull the registered hook command straight out of settings.json. Testing
+    anything else would be testing a hook your harness isn't running.
+
+    `marker` is the guard's script filename; both guards register their own
+    PreToolUse entry and are recognised by it.
+    """
+    _entry, command, err = _hook_entry(target, marker)
+    return command, err
+
+
+def find_hook_matcher(target, marker="gate_guard.py"):
+    """The tool-name matcher on the entry that registers the guard.
+
+    Returns the matcher string, or None when it cannot be read at all. An
+    absent matcher key means match-everything, so it reports `"*"` rather than
+    None -- None is reserved for "could not determine", which callers must not
+    render as a warning.
+    """
+    entry, _command, err = _hook_entry(target, marker)
+    if err or not isinstance(entry, dict):
+        return None
+    matcher = entry.get("matcher")
+    return "*" if matcher is None else str(matcher)
+
+
+def matcher_covers_everything(matcher):
+    """True when every tool reaches the guard.
+
+    Unknown (None) counts as True on purpose: this gates a warning, and a
+    warning fired because we could not read the config would be noise on a
+    healthy install.
+    """
+    return matcher is None or str(matcher).strip() in ("", "*")
 
 
 def wired_guard_path(command, target):
@@ -815,7 +853,7 @@ SUBAGENT_UNPROVEN = """
   Subagent coverage is UNPROVEN, which is not the same as broken.
 
   No call recorded so far carried a marker naming a subagent as the caller.
-  Three different situations produce that identical result, and this file
+  Four different situations produce that identical result, and this file
   cannot tell them apart on its own:
 
     a. No subagent has made a tool call since the heartbeat started.
@@ -823,23 +861,32 @@ SUBAGENT_UNPROVEN = """
        made them -- the guard is binding, you just cannot attribute calls.
     c. Subagent calls never reach the hook at all. This is the one that
        matters: it means delegation silently widens what the agent may do.
-
+    d. The subagent used a tool your matcher does not select, so no hook
+       call was ever generated -- for any agent. This looks identical to
+       (c) and is not a harness bug.
+{matcher_note}
   To tell them apart, with the heartbeat at {invocations} invocations now:
 
-    1. Have a subagent make ONE ordinary tool call (a file read is enough).
+    1. Have a subagent make ONE ordinary tool call, using a tool your
+       matcher actually covers -- see the line above. Rule (d) out first;
+       it is the cheapest of the four to eliminate and the easiest to
+       mistake for (c).
     2. Re-run this check.
        * invocations went UP and a subagent bucket appeared  -> covered (a).
        * invocations went UP, still no bucket                -> (b).
-       * invocations did NOT move                            -> (c): the
-         hook is not firing for subagent tool calls. Until that is fixed,
-         do not delegate an action the main session is not allowed to take.
+       * invocations did NOT move, and the tool WAS in your matcher -> (c):
+         the hook is not firing for subagent tool calls. Until that is
+         fixed, do not delegate an action the main session may not take.
+       * invocations did NOT move, and it was NOT in your matcher -> (d).
+         Re-probe before reporting anything upstream: a false report of (c)
+         is worse than silence, because it buries the real ones.
 
   Whatever you find, the number above is evidence rather than assumption --
   which is more than the open upstream reports of this have to work with.
 """
 
 
-def subagent_row(hb):
+def subagent_row(hb, matcher=None):
     """Report whether any subagent call has ever been seen by the guard.
 
     Deliberately never claims "main session only". A payload with no agent
@@ -860,8 +907,10 @@ def subagent_row(hb):
             f"{'' if v.get('invocations') == 1 else 's'})"
             for k, v in sorted(seen.items())[:3])
         return (PASS, "subagent coverage", f"observed: {names}")
-    return (WARN, "subagent coverage",
-            "unproven -- no call has named a subagent caller")
+    detail = "unproven -- no call has named a subagent caller"
+    if not matcher_covers_everything(matcher):
+        detail += f"; matcher {matcher!r} filters tools -- probe with one it covers"
+    return (WARN, "subagent coverage", detail)
 
 
 def liveness_facts(target, max_age_hours):
@@ -879,10 +928,11 @@ def liveness_facts(target, max_age_hours):
     facts = {
         "target": target, "rows": [], "ok": True, "stop": None,
         "command": None, "config": {}, "config_path": None,
-        "hb_path": None, "hb": None,
+        "hb_path": None, "hb": None, "matcher": None,
         "invocations": 0, "probes": 0, "last": None, "age": None,
     }
 
+    facts["matcher"] = find_hook_matcher(target)
     command, err = find_hook_command(target)
     if not command:
         facts["rows"].append(
@@ -959,7 +1009,7 @@ def liveness_facts(target, max_age_hours):
     facts["rows"].append((PASS, "invocations recorded",
                           f"{invocations} from the harness, {probes} from verify.py"))
     facts["rows"].append((PASS, "blocks recorded", str(hb.get("blocks") or 0)))
-    facts["rows"].append(subagent_row(hb))
+    facts["rows"].append(subagent_row(hb, facts.get("matcher")))
     # A call arriving under bypassPermissions and still reaching this hook is
     # worth stating out loud: it is the setting under which hook coverage is
     # most often assumed and least often checked.
@@ -1052,8 +1102,19 @@ def check_live(target, max_age_hours):
     # Not folded into `ok`: an unproven subagent is the normal state of a fresh
     # install, not a misconfiguration, and failing the check for it would train
     # people to ignore the one line here that reports a real wiring fault.
-    if subagent_row(facts["hb"])[0] != PASS:
-        print(SUBAGENT_UNPROVEN.format(invocations=facts["invocations"]))
+    matcher = facts.get("matcher")
+    if subagent_row(facts["hb"], matcher)[0] != PASS:
+        if matcher_covers_everything(matcher):
+            matcher_note = (
+                "\n  Your matcher is %r, so every tool reaches the guard and\n"
+                "  (d) is already ruled out.\n" % (matcher or "*"))
+        else:
+            matcher_note = (
+                "\n  Your matcher is %r. Only those tools reach the guard, so\n"
+                "  probe with one of them -- a tool outside this list proves\n"
+                "  nothing about subagent coverage.\n" % matcher)
+        print(SUBAGENT_UNPROVEN.format(
+            invocations=facts["invocations"], matcher_note=matcher_note))
 
     if facts["ok"]:
         print("\nThe harness is calling the guard, and calling the copy you "
