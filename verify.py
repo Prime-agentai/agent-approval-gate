@@ -326,19 +326,43 @@ def check_wiring(target):
                      f"{state_rel} not found -- tier fails closed to 0, so "
                      f"tier-gated rules stay blocked"))
 
+    rows.append(allowlist_row(target, config))
+
+    return rows, command, config, state_abspath
+
+
+def allowlist_row(target, config):
+    """One row describing the git-push allowlist.
+
+    Reports the three no-push states separately, because they behave
+    identically (every push blocked) but are fixed differently, and a report
+    that calls a present-but-empty file PASS tells the operator the opposite
+    of what they will experience."""
+    label = "git push allowlist present"
     remotes = os.path.join(target, config.get("approved_remotes_file",
                                               "approved-remotes.txt"))
-    if os.path.isfile(remotes):
+    if not os.path.isfile(remotes):
+        # isfile() is false for a directory too, which is why the detail says
+        # "no readable file" rather than asserting the path is empty.
+        if os.path.exists(remotes):
+            return (WARN, label,
+                    f"{remotes} exists but is not a readable file -- the "
+                    f"guard fails closed and every git push is blocked")
+        return (WARN, label,
+                "missing -- every git push is blocked (fail closed)")
+    try:
         with open(remotes) as f:
             entries = [l.strip() for l in f
                        if l.strip() and not l.startswith("#")]
-        rows.append((PASS, "git push allowlist present",
-                     f"{len(entries)} approved remote(s)"))
-    else:
-        rows.append((WARN, "git push allowlist present",
-                     "missing -- every git push is blocked (fail closed)"))
-
-    return rows, command, config, state_abspath
+    except (OSError, UnicodeDecodeError) as e:
+        return (WARN, label,
+                f"{remotes} exists but cannot be read ({e}) -- the guard "
+                f"fails closed and every git push is blocked")
+    if not entries:
+        return (WARN, label,
+                "file exists but lists 0 remotes -- every git push is "
+                "blocked, same as if it were missing")
+    return (PASS, label, f"{len(entries)} approved remote(s)")
 
 
 def configured_rule_ids(config):

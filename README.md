@@ -184,14 +184,20 @@ differences matter:
   in the working directory.)
 - **No `gate-guard.config.json` and no `approved-remotes.txt` are created**,
   so you get the built-in defaults — and a missing allowlist blocks *every*
-  `git push`, by design. That is the first thing you will hit. Create the file
-  when you are ready to allow one:
+  `git push`, by design. That is the first thing you will hit. The block
+  message says so explicitly, names the absolute path the file should be at,
+  and distinguishes *"there is no allowlist"* from *"your remote is not on
+  it"* — they need different fixes. Create the file when you are ready to
+  allow one:
 
   ```bash
   echo 'github.com/you/' > approved-remotes.txt
   ```
 
-  Then read the allowlist notes further down — they apply identically.
+  Create it yourself, from a shell. Your agent cannot: `approved-remotes.txt`
+  is a protected path, so writing it is blocked through every tool. An agent
+  that can edit its own allowlist does not have one. Then read the allowlist
+  notes further down — they apply identically.
 
 To customise `protected_paths`, point `state_path` at your real state file, or
 have the scripts live inside your repo, use the script install instead. The two
@@ -231,14 +237,32 @@ Then read `gate-guard.config.json` and add your own files to
 `protected_paths`. Note that `approved-remotes.txt` is created **empty**: an
 empty or missing allowlist blocks `git push` from every tool call,
 unconditionally — fail closed, not fail open. Add a line only when you mean
-it.
+it. `verify.py` reports a fresh install as `WARN ... 0 remotes`, which is
+accurate rather than alarming: nothing can push yet.
+
+**The four ways a push gets blocked, and why they are not one thing.** All
+four produce a blocked push, so it is tempting to give them one message. They
+have four different fixes, so the guard names which one you are in:
+
+| State | What it means | Fix |
+|---|---|---|
+| Allowlist **missing** | No file. There is no list to be on. | A human creates it. |
+| Allowlist **empty** | File exists, lists nothing. | Add a line. |
+| Allowlist **unreadable** | Bad permissions/encoding — the guard does not know what you approved. | Fix the file; the block clears itself. |
+| **No match** | The list is fine; this destination is not on it. | Push elsewhere, or add it deliberately. |
+
+The first three are *not* decisions about your remote, and a message that
+says "only approved remotes are allowed" when the allowlist does not exist
+sends you looking for a rule that is not the problem.
 
 **One consequence that will look like a bug the first time it happens:** the
 allowlist is matched against the *command string*, and `git push origin main`
 does not contain a destination. There is nothing in it for an allowlist entry
 to match, so it is blocked even when that remote is on your list. This is
 correct — a guard that cannot see where a push is going must not wave it
-through — but it means an approved push has to name its destination:
+through — but it means an approved push has to name its destination. The
+block message detects this case (no host anywhere in the command) and says so
+rather than leaving you to work it out:
 
 ```bash
 git push https://github.com/you/your-repo.git main    # matches the allowlist
@@ -272,7 +296,7 @@ WIRING -- approval gate
   PASS  hook script exists at the registered path       /p/bin/gate_guard.py
   PASS  config resolves (via hook command)              /p/gate-guard.config.json
   PASS  state file readable                             agent-state.json, trust tier 0
-  PASS  git push allowlist present                      0 approved remote(s)
+  WARN  git push allowlist present                      file exists but lists 0 remotes -- every git push is blocked, same as if it were missing
 
 BEHAVIOR -- approval gate
   PASS  POST to a payment API                           blocked [PAYMENT_API_WRITE]

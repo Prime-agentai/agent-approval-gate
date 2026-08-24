@@ -70,7 +70,119 @@ def call(tool_name, tool_input, config):
     return hit
 
 
+def check_allowlist_states():
+    """The git-push allowlist has four distinct states and they must not all
+    read as 'your remote was rejected'. A missing file is an install state, an
+    empty file is a config mistake, an unreadable file is an unknown, and a
+    non-match is the rule working. Each gets its own tmpdir so the states
+    cannot leak into each other."""
+    remotes_name = "approved-remotes.txt"
+    bare_push = f"{_GIT_PUSH} origin main"
+
+    # --- missing ---------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        state, entries, path, _ = gate_guard.read_approved_remotes(config)
+        check("a missing allowlist reports state 'missing', not empty",
+              state == gate_guard.ALLOWLIST_MISSING and entries == [])
+        check("load_approved_remotes() still returns a plain list of entries",
+              gate_guard.load_approved_remotes(config) == [])
+
+        hit = call("Bash", {"command": bare_push}, config)
+        check("git push with no allowlist file is blocked", hit is not None)
+        missing_msg = hit[1]
+        check("...and the message says the allowlist does not exist",
+              "does not exist" in missing_msg)
+        check("...and names the absolute path the file should be at",
+              path in missing_msg)
+        check("...and says it is not a rejection of this remote",
+              "NOT 'your remote was rejected'" in missing_msg)
+        check("...and tells the agent not to create the file itself",
+              "protected path" in missing_msg)
+        check("...and names the plugin install as an expected way to get here",
+              "plugin install writes no config" in missing_msg)
+
+    # --- empty (present, but nothing in it) -------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, remotes_name), "w") as f:
+            f.write("# only a comment\n\n")
+        state, entries, _, _ = gate_guard.read_approved_remotes(config)
+        check("a comments-only allowlist reports state 'empty', not missing",
+              state == gate_guard.ALLOWLIST_EMPTY and entries == [])
+
+        hit = call("Bash", {"command": bare_push}, config)
+        check("git push with an empty allowlist is blocked", hit is not None)
+        empty_msg = hit[1]
+        check("...and the message says the file exists but lists no remotes",
+              "exists but lists no remotes" in empty_msg)
+        check("...and is NOT the same message as the missing case",
+              empty_msg != missing_msg and "does not exist" not in empty_msg)
+
+    # --- unreadable -------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        os.mkdir(os.path.join(tmp, remotes_name))  # a directory, not a file
+        state, entries, _, detail = gate_guard.read_approved_remotes(config)
+        check("an unreadable allowlist reports state 'unreadable', not empty",
+              state == gate_guard.ALLOWLIST_UNREADABLE and entries == [])
+        check("...and carries the underlying error as detail", bool(detail))
+
+        hit = call("Bash", {"command": bare_push}, config)
+        check("git push with an unreadable allowlist is blocked (fail closed)",
+              hit is not None)
+        unreadable_msg = hit[1]
+        check("...and the message says it could not be read",
+              "could not be read" in unreadable_msg)
+        check("...and calls it an unknown rather than a decision",
+              "unknown, not a" in unreadable_msg)
+
+    # --- populated: non-match, alias vs explicit host ---------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, remotes_name), "w") as f:
+            f.write("# comment\ngithub.com/example-org/\ngithub.com/other-org/\n")
+        state, entries, _, _ = gate_guard.read_approved_remotes(config)
+        check("a populated allowlist reports state 'ok' with its entries",
+              state == gate_guard.ALLOWLIST_OK and len(entries) == 2)
+
+        check(
+            "git push to an approved remote is still allowed",
+            call("Bash", {"command": f"{_GIT_PUSH} https://github.com/example-org/repo.git main"},
+                 config) is None,
+        )
+
+        hit = call("Bash", {"command": bare_push}, config)
+        check("git push naming only an alias is blocked", hit is not None)
+        alias_msg = hit[1]
+        check("...and the message lists what IS approved",
+              "github.com/example-org/" in alias_msg)
+        check("...and explains that a bare alias can never match a URL prefix",
+              "bare alias" in alias_msg)
+
+        hit = call(
+            "Bash",
+            {"command": f"{_GIT_PUSH} https://github.com/not-approved/repo.git main"},
+            config,
+        )
+        check("git push to an explicit unapproved host is blocked",
+              hit is not None)
+        check("...and does NOT get the alias explanation, which does not apply",
+              "bare alias" not in hit[1])
+
+    # --- truncation, so a long allowlist does not produce a wall of text --
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, remotes_name), "w") as f:
+            f.write("".join(f"github.com/org-{i}/\n" for i in range(9)))
+        hit = call("Bash", {"command": bare_push}, config)
+        check("a long allowlist is truncated in the block message",
+              hit is not None and "+4 more" in hit[1] and "(9)" in hit[1])
+
+
 def main():
+    check_allowlist_states()
+
     with tempfile.TemporaryDirectory() as tmp:
         config = make_config(tmp)
 

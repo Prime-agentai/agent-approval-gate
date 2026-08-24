@@ -408,5 +408,56 @@ class SubagentRowMatcherTests(unittest.TestCase):
         self.assertNotIn("matcher", detail)
 
 
+class AllowlistRowTests(unittest.TestCase):
+    """A present-but-empty allowlist blocks every push exactly as a missing
+    one does. Reporting it PASS because the file exists is the failure this
+    row is here to avoid."""
+
+    NAME = "approved-remotes.txt"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def row(self):
+        return verify.allowlist_row(self.tmp, {})
+
+    def write(self, text):
+        with open(os.path.join(self.tmp, self.NAME), "w") as f:
+            f.write(text)
+
+    def test_missing_file_warns(self):
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("missing", detail)
+
+    def test_populated_file_passes_with_a_count(self):
+        self.write("# comment\ngithub.com/example-org/\n")
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.PASS)
+        self.assertIn("1 approved remote", detail)
+
+    def test_comments_only_file_warns_rather_than_passing(self):
+        self.write("# nothing approved yet\n\n")
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("0 remotes", detail)
+        self.assertIn("same as if it were missing", detail)
+
+    def test_a_directory_in_its_place_is_not_reported_as_missing(self):
+        os.mkdir(os.path.join(self.tmp, self.NAME))
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("not a readable file", detail)
+
+    def test_config_can_rename_the_allowlist(self):
+        with open(os.path.join(self.tmp, "remotes.allow"), "w") as f:
+            f.write("github.com/example-org/\n")
+        status, _, detail = verify.allowlist_row(
+            self.tmp, {"approved_remotes_file": "remotes.allow"})
+        self.assertEqual(status, verify.PASS)
+        self.assertIn("1 approved remote", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

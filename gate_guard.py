@@ -261,13 +261,49 @@ def load_trust_tier(config):
         return 0  # Fail closed: no readable state means the lowest tier.
 
 
-def load_approved_remotes(config):
-    remotes_path = os.path.join(config["_project_root"], config["approved_remotes_file"])
+# The states the git-push allowlist can be in. They are not the same thing
+# and must not produce the same message. "the file does not exist" is an
+# installation state a human has to fix; "the file exists and lists nothing"
+# is a configuration mistake; "your remote is not on the list" is the rule
+# doing its job. Collapsing the first two into the third reports an ABSENCE as
+# a DECISION -- it sends the operator looking for a rule that is not the
+# problem. The README's "four ways a push gets blocked" table is the
+# user-facing version of this list; keep the two in step.
+ALLOWLIST_OK = "ok"
+ALLOWLIST_MISSING = "missing"
+ALLOWLIST_EMPTY = "empty"
+ALLOWLIST_UNREADABLE = "unreadable"
+
+
+def read_approved_remotes(config):
+    """Read the git-push allowlist. Returns (state, entries, path, detail).
+
+    `entries` is always a list and is empty for every state except OK, so a
+    caller that only wants the remotes can ignore the rest. `state` is what
+    lets the block message say which of the three no-push situations the
+    operator is actually in."""
+    path = os.path.join(config["_project_root"], config["approved_remotes_file"])
     try:
-        with open(remotes_path) as f:
-            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        with open(path) as f:
+            lines = f.readlines()
     except FileNotFoundError:
-        return []
+        return ALLOWLIST_MISSING, [], path, ""
+    except OSError as exc:
+        # Present but unreadable (permissions, a directory, a bad mount). This
+        # is NOT "no remotes are approved" -- we do not know what it says.
+        return ALLOWLIST_UNREADABLE, [], path, f"{type(exc).__name__}: {exc}"
+    except UnicodeDecodeError as exc:
+        return ALLOWLIST_UNREADABLE, [], path, f"UnicodeDecodeError: {exc}"
+    entries = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+    if not entries:
+        return ALLOWLIST_EMPTY, [], path, f"{len(lines)} line(s), none of them a remote"
+    return ALLOWLIST_OK, entries, path, ""
+
+
+def load_approved_remotes(config):
+    """Just the approved remotes, for callers that do not care why the list
+    is empty. Anything user-facing should use read_approved_remotes()."""
+    return read_approved_remotes(config)[1]
 
 
 def flatten(obj):
@@ -340,17 +376,92 @@ def check_secret_leak(text, config):
     return None
 
 
+# A push command that names no host at all -- `git push origin main` -- can
+# never match a URL-prefix allowlist, because the match is a substring test
+# against the command text and the alias is resolved by git, not by us. That
+# is a different mistake from pushing to a genuinely unapproved host, and the
+# fix is different too, so it gets its own sentence.
+_HOST_IN_COMMAND = re.compile(r"://|\bgit@|[A-Za-z0-9-]+\.[A-Za-z]{2,}[/:]")
+
+# How many approved remotes to name in a block message before truncating.
+_MAX_REMOTES_SHOWN = 5
+
+
+def _allowlist_fix_note(path, filename):
+    """The same two facts every not-configured case needs: where the file
+    goes, and that the agent must not create it itself."""
+    return (
+        f"A human has to create it, at:\n    {path}\n"
+        "one approved remote prefix per line ('#' comments allowed), e.g. "
+        "`github.com/your-org/`.\n"
+        f"Do not create it yourself: `{filename}` is a protected path, so "
+        "writing it is blocked too, by design -- an agent that can edit its "
+        "own allowlist does not have one. File an approval request instead."
+    )
+
+
 def check_git_push(text, config):
     if not re.search(r"(^|[;&|\s])git\s+push\b", text):
         return None
-    approved = load_approved_remotes(config)
-    if approved and any(r in text for r in approved):
+    filename = config["approved_remotes_file"]
+    state, approved, path, detail = read_approved_remotes(config)
+
+    if state == ALLOWLIST_OK and any(r in text for r in approved):
         return None
-    return (
-        "GIT_PUSH_UNAPPROVED",
+
+    if state == ALLOWLIST_MISSING:
+        return (
+            "GIT_PUSH_UNAPPROVED",
+            "Pushing to a remote publishes work outward, so it is allowed "
+            "only to remotes on your allowlist -- and that allowlist does "
+            f"not exist. There is no file at {path}.\n\n"
+            "This is NOT 'your remote was rejected'. There is no list to be "
+            "on, so every push is blocked and will stay blocked until the "
+            "file exists. If you installed this as a plugin, note that a "
+            "plugin install writes no config into your project; this is "
+            "expected on first run, not a bug.\n\n"
+            + _allowlist_fix_note(path, filename),
+        )
+
+    if state == ALLOWLIST_EMPTY:
+        return (
+            "GIT_PUSH_UNAPPROVED",
+            f"{path} exists but lists no remotes ({detail}), so every push "
+            "is blocked. An empty allowlist is not the same as a missing "
+            "one, and neither is the same as your remote being rejected -- "
+            "this one means the file is there and you have not put anything "
+            "in it yet.\n\n"
+            + _allowlist_fix_note(path, filename),
+        )
+
+    if state == ALLOWLIST_UNREADABLE:
+        return (
+            "GIT_PUSH_UNAPPROVED",
+            f"{path} exists but could not be read ({detail}). The guard "
+            "cannot tell which remotes you approved, so it is failing "
+            "closed and blocking the push. This is an unknown, not a "
+            "decision: fix the file's permissions or encoding and the "
+            "block goes away on its own.",
+        )
+
+    shown = ", ".join(approved[:_MAX_REMOTES_SHOWN])
+    if len(approved) > _MAX_REMOTES_SHOWN:
+        shown += f", +{len(approved) - _MAX_REMOTES_SHOWN} more"
+    msg = (
         "Pushing to a remote publishes work outward. Only remotes listed in "
-        f"{config['approved_remotes_file']} are allowed.",
+        f"{filename} are allowed, and this command names none of them.\n"
+        f"Approved ({len(approved)}): {shown}"
     )
+    if not _HOST_IN_COMMAND.search(text):
+        msg += (
+            "\n\nThe command names no host at all. The allowlist is matched "
+            "as a substring of the command text, so a bare alias like "
+            "`origin` can never match a URL prefix even when it resolves to "
+            "an approved remote. Name the destination explicitly instead of "
+            "relying on the alias -- that is not a workaround, it is how the "
+            "guard is able to check where the push is going."
+        )
+    return ("GIT_PUSH_UNAPPROVED", msg)
 
 
 # Fields a harness may put in the hook payload to say WHO is making this call.
