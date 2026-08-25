@@ -180,8 +180,149 @@ def check_allowlist_states():
               hit is not None and "+4 more" in hit[1] and "(9)" in hit[1])
 
 
+def check_trust_tier_states():
+    """The trust tier has five distinct states and four of them produce tier
+    0. Tier 0 is the right *behaviour* in all four -- an unknown tier must
+    fail closed -- so these tests do not check that the block happened
+    differently. They check that the operator is told whether the 0 was read
+    or assumed, because only one of the five is a decision about them.
+
+    Each state gets its own tmpdir so they cannot leak into each other."""
+    pkg = f"{_PKG_MGR} {_PKG_VERB} left-pad"
+
+    def tier_block(config):
+        hit = call("Bash", {"command": pkg}, config)
+        check("a tier-gated action is blocked below the threshold",
+              hit is not None)
+        return hit[1] if hit else ""
+
+    # --- state file missing ----------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        state, tier, path, _ = gate_guard.read_trust_tier(config)
+        check("a missing state file reports state 'state_missing'",
+              state == gate_guard.TIER_STATE_MISSING)
+        check("...and still falls back to tier 0 (behaviour unchanged)",
+              tier == 0)
+        check("load_trust_tier() still returns a plain int",
+              gate_guard.load_trust_tier(config) == 0)
+
+        msg = tier_block(config)
+        check("...and the message says the tier was assumed, not read",
+              "WAS NOT READ" in msg and "ASSUMED" in msg)
+        check("...and names the absolute path the state file should be at",
+              path in msg)
+        check("...and says the block may be an install problem, not policy",
+              "may not be a policy decision" in msg)
+        check("...and names the plugin install as a way to arrive here",
+              "plugin install" in msg)
+        check("...and says a human has to fix it, since STATE.json is protected",
+              "the agent cannot" in msg)
+
+    # --- state file present but not JSON ----------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, "STATE.json"), "w") as f:
+            f.write("{not json,")
+        state, tier, _p, detail = gate_guard.read_trust_tier(config)
+        check("a malformed state file reports 'state_unreadable', not missing",
+              state == gate_guard.TIER_STATE_UNREADABLE and tier == 0)
+        check("...and the detail names the parse failure",
+              "invalid JSON" in detail)
+        msg = tier_block(config)
+        check("...and the message does not claim the file is absent",
+              "could not be read" in msg and "there is no file" not in msg)
+        check("...and does not offer the plugin-install explanation, which "
+              "does not apply when the file exists",
+              "plugin install" not in msg)
+
+    # --- state file is valid JSON but not an object ------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, "STATE.json"), "w") as f:
+            f.write("[1, 2, 3]")
+        state, tier, _p, detail = gate_guard.read_trust_tier(config)
+        check("a JSON array where the state object should be is 'unreadable'",
+              state == gate_guard.TIER_STATE_UNREADABLE and tier == 0)
+        check("...and the detail says what was found instead of an object",
+              "not an object" in detail)
+
+    # --- state file fine, tier field absent --------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, "STATE.json"), "w") as f:
+            json.dump({"phase": "build", "notes": "no tier here"}, f)
+        state, tier, _p, detail = gate_guard.read_trust_tier(config)
+        check("a state file with no tier field reports 'field_missing'",
+              state == gate_guard.TIER_FIELD_MISSING and tier == 0)
+        check("...and the detail says how many keys it did have",
+              "2 key(s)" in detail)
+        msg = tier_block(config)
+        check("...and the message says the field is what is absent, not the file",
+              "does not contain a 'trust_tier' field" in msg)
+
+    # --- tier field present but not an integer -----------------------------
+    for value, label in (("1", "a quoted string"), (True, "a boolean"),
+                         (None, "null"), (1.5, "a float")):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            with open(os.path.join(tmp, "STATE.json"), "w") as f:
+                json.dump({"trust_tier": value}, f)
+            state, tier, _p, _d = gate_guard.read_trust_tier(config)
+            check(f"tier of {label} is 'field_invalid' and does NOT grant a tier",
+                  state == gate_guard.TIER_FIELD_INVALID and tier == 0)
+            check(f"...and a tier-gated action stays blocked with {label}",
+                  call("Bash", {"command": pkg}, config) is not None)
+
+    # --- the one state that IS a decision ---------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, "STATE.json"), "w") as f:
+            json.dump({"trust_tier": 0}, f)
+        state, tier, path, _d = gate_guard.read_trust_tier(config)
+        check("a real tier 0 reports state 'ok', not one of the failures",
+              state == gate_guard.TIER_OK and tier == 0)
+        msg = tier_block(config)
+        check("...and the message does NOT say the tier was assumed",
+              "WAS NOT READ" not in msg)
+        check("...and still orients the operator: tier, threshold, and source",
+              "Your tier is 0" in msg and path in msg)
+
+        # The rule's own explanation must survive the added note.
+        check("...and the rule's original explanation is still in the message",
+              "Installing packages changes this machine" in msg)
+
+    # --- tier at/above the threshold still turns the rule off --------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        with open(os.path.join(tmp, "STATE.json"), "w") as f:
+            json.dump({"trust_tier": 1}, f)
+        check("a genuine tier 1 read from disk turns tier-gated rules off",
+              call("Bash", {"command": pkg}, config) is None)
+
+    # --- the audit log records which of the two zeros it was ---------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        gate_guard.log_block("PACKAGE_INSTALL", "Bash", pkg, 0, config,
+                             gate_guard.TIER_STATE_MISSING)
+        with open(os.path.join(tmp, config["blocked_log"])) as f:
+            entry = json.loads(f.readline())
+        check("blocked.jsonl records an assumed tier as assumed",
+              entry["trust_tier_at_block"] == 0
+              and entry["trust_tier_source"] == "state_missing")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        gate_guard.log_block("PACKAGE_INSTALL", "Bash", pkg, 0, config,
+                             gate_guard.TIER_OK)
+        with open(os.path.join(tmp, config["blocked_log"])) as f:
+            entry = json.loads(f.readline())
+        check("...and a read tier as read", entry["trust_tier_source"] == "read")
+
+
 def main():
     check_allowlist_states()
+    check_trust_tier_states()
 
     with tempfile.TemporaryDirectory() as tmp:
         config = make_config(tmp)

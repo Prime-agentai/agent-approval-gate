@@ -310,25 +310,85 @@ def check_wiring(target):
 
     state_rel = config.get("state_path", "STATE.json")
     state_abspath = os.path.join(target, state_rel)
-    if os.path.isfile(state_abspath):
-        try:
-            with open(state_abspath) as f:
-                tier = json.load(f).get(
-                    config.get("trust_tier_field", "trust_tier"), 0)
-            rows.append((PASS, "state file readable",
-                         f"{state_rel}, trust tier {tier}"))
-        except json.JSONDecodeError as e:
-            rows.append((WARN, "state file readable",
-                         f"{state_rel}: invalid JSON ({e}) -- tier fails "
-                         f"closed to 0"))
-    else:
-        rows.append((WARN, "state file readable",
-                     f"{state_rel} not found -- tier fails closed to 0, so "
-                     f"tier-gated rules stay blocked"))
+    rows.append(trust_tier_row(state_abspath, state_rel, config))
 
     rows.append(allowlist_row(target, config))
 
     return rows, command, config, state_abspath
+
+
+# Mirrors gate_guard.read_trust_tier()'s states. verify.py deliberately does
+# not import the guard -- it verifies whatever version is installed at
+# --target, which may not be this one -- so the states are duplicated here on
+# purpose and the two must be kept in step by hand.
+TIER_OK = "ok"
+TIER_STATE_MISSING = "state_missing"
+TIER_STATE_UNREADABLE = "state_unreadable"
+TIER_FIELD_MISSING = "field_missing"
+TIER_FIELD_INVALID = "field_invalid"
+
+
+def read_trust_tier(state_abspath, config):
+    """Read the tier the way the guard does. Returns (state, tier, detail).
+
+    `tier` is 0 for every state except OK, matching the guard's fail-closed
+    fallback, so callers that only need a number can use it directly. This is
+    the single place verify.py reads the tier: the wiring row, the behaviour
+    probes' tier-threshold logic, and the evidence report all go through here,
+    because three copies of `except: tier = 0` is three chances to disagree
+    with the guard about what tier the project is actually at."""
+    field = config.get("trust_tier_field", "trust_tier")
+    if not state_abspath or not os.path.isfile(state_abspath):
+        return TIER_STATE_MISSING, 0, ""
+    try:
+        with open(state_abspath) as f:
+            raw = json.load(f)
+    except ValueError as e:
+        return TIER_STATE_UNREADABLE, 0, f"invalid JSON ({e})"
+    except (OSError, UnicodeDecodeError) as e:
+        return TIER_STATE_UNREADABLE, 0, f"{type(e).__name__}: {e}"
+    if not isinstance(raw, dict):
+        return TIER_STATE_UNREADABLE, 0, \
+            f"top level is {type(raw).__name__}, not an object"
+    if field not in raw:
+        return TIER_FIELD_MISSING, 0, f"{len(raw)} key(s), none of them {field!r}"
+    value = raw[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return TIER_FIELD_INVALID, 0, \
+            f"{field} = {value!r} ({type(value).__name__}), not an integer"
+    return TIER_OK, value, ""
+
+
+def trust_tier_row(state_abspath, state_rel, config):
+    """One row describing where the trust tier came from.
+
+    Four of the five states produce tier 0 and identical *behaviour* -- every
+    tier-gated rule blocked -- but only one of them is a decision. Reporting
+    `PASS ... trust tier 0` for a state file that has no tier field in it at
+    all is the same mistake the allowlist row used to make: it tells the
+    operator the config is fine when the guard is running on a guess."""
+    label = "trust tier readable"
+    min_tier = config.get("min_tier_for_tier_gated", 1)
+    state, tier, detail = read_trust_tier(state_abspath, config)
+    if state == TIER_OK:
+        gated = "tier-gated rules are ON" if tier < min_tier else \
+                "tier-gated rules are OFF"
+        return (PASS, label,
+                f"{state_rel}, trust tier {tier} (unlocks at {min_tier}; "
+                f"{gated})")
+    assumed = (f"tier is ASSUMED 0, not read -- tier-gated rules stay blocked "
+               f"and the block message says so")
+    if state == TIER_STATE_MISSING:
+        return (WARN, label,
+                f"{state_rel} not found -- {assumed}. Expected on a fresh "
+                f"plugin install, which writes no state file")
+    if state == TIER_STATE_UNREADABLE:
+        return (WARN, label, f"{state_rel}: {detail} -- {assumed}")
+    if state == TIER_FIELD_MISSING:
+        return (WARN, label,
+                f"{state_rel} parses but has no trust-tier field ({detail}) "
+                f"-- {assumed}")
+    return (WARN, label, f"{state_rel}: {detail} -- {assumed}")
 
 
 def allowlist_row(target, config):
@@ -1363,15 +1423,16 @@ def evidence_report(target, max_age_hours, include_attempts=False):
 
     state_path = None
     tier = None
+    tier_source = None
     if command:
         state_path = project_path(target, command, config, "state_path", "STATE.json")
-    if state_path and os.path.isfile(state_path):
-        try:
-            with open(state_path) as f:
-                tier = json.load(f).get(
-                    config.get("trust_tier_field", "trust_tier"))
-        except (ValueError, OSError):
-            tier = None
+    # An evidence artifact must not print a tier it did not read. Where the
+    # state file is missing or malformed the tier stays None and the source
+    # names why, rather than reporting the fail-closed 0 as an observation.
+    tier_state, read_tier, _detail = read_trust_tier(state_path, config)
+    tier_source = "read" if tier_state == TIER_OK else tier_state
+    if tier_state == TIER_OK:
+        tier = read_tier
 
     body = {
         "report": "gate-enforcement-evidence",
@@ -1423,6 +1484,7 @@ def evidence_report(target, max_age_hours, include_attempts=False):
             "rule_ids_source": "config" if rule_ids else "built-in defaults",
             "protected_paths": config.get("protected_paths") or [],
             "trust_tier_at_report": tier,
+            "trust_tier_source": tier_source,
             "min_tier_for_tier_gated": config.get("min_tier_for_tier_gated"),
         },
         "enforcement": blocks,
@@ -1546,6 +1608,15 @@ def render_evidence_markdown(report):
         add(f"- **Trust tier at report time:** {c['trust_tier_at_report']}"
             + (f" (tier-gated rules apply below {c['min_tier_for_tier_gated']})"
                if c["min_tier_for_tier_gated"] is not None else ""))
+    elif c.get("trust_tier_source"):
+        # Not "tier 0". The tier was never read, and a report that prints the
+        # fail-closed fallback as if it were an observation is asserting
+        # something it did not verify.
+        add(f"- **Trust tier at report time:** not read "
+            f"(`{c['trust_tier_source']}`) -- the guard fell back to its "
+            f"lowest tier, so tier-gated rules were blocking throughout, but "
+            f"this report cannot state what tier the project was configured "
+            f"at.")
     add("")
     callers = a["callers_seen"]
     if callers:
@@ -2078,14 +2149,7 @@ def main():
         "KEY_MATERIAL", "FUND_MOVEMENT", "CONTRACT_DEPLOY", "PAYMENT_API_WRITE",
         "ACCOUNT_SIGNUP_FLOW", "PACKAGE_INSTALL", "DOMAIN_REGISTRAR",
     }
-    tier = 0
-    if state_abspath and os.path.isfile(state_abspath):
-        try:
-            with open(state_abspath) as f:
-                tier = int(json.load(f).get(
-                    config.get("trust_tier_field", "trust_tier"), 0))
-        except Exception:
-            tier = 0
+    _tier_state, tier, _tier_detail = read_trust_tier(state_abspath, config)
     min_tier = config.get("min_tier_for_tier_gated", 1)
     tier_gated_ids = {r.get("id") for r in (config.get("tier_gated_rules") or [])} \
         or {"PACKAGE_INSTALL", "DOMAIN_REGISTRAR"}

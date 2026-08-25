@@ -250,15 +250,125 @@ def load_config():
     return config
 
 
-def load_trust_tier(config):
-    """Read trust tier from disk. Never trust anything the session asserts --
+# The states a trust-tier read can be in. Same defect class as the allowlist
+# below, one rule over: `except Exception: return 0` reports an ABSENCE as a
+# DECISION. Tier 0 is the correct *behaviour* in every one of these states --
+# an unknown tier must fail closed, always, and that does not change -- but
+# "your state file does not exist" and "you are at tier 0" are not the same
+# message, and only one of them names something the operator can fix. The
+# README's "why does it say tier 0" table is the user-facing version of this
+# list; keep the two in step.
+TIER_OK = "ok"
+TIER_STATE_MISSING = "state_missing"
+TIER_STATE_UNREADABLE = "state_unreadable"
+TIER_FIELD_MISSING = "field_missing"
+TIER_FIELD_INVALID = "field_invalid"
+
+# What an unreadable tier is assumed to be. Not configurable on purpose: the
+# whole point is that the fallback is the lowest privilege there is.
+FALLBACK_TIER = 0
+
+
+def read_trust_tier(config):
+    """Read the trust tier from disk. Returns (state, tier, path, detail).
+
+    `tier` is always a usable int -- FALLBACK_TIER for every state except OK
+    -- so the decision path can ignore `state` entirely and still fail closed.
+    `state` exists so the operator can be told whether that 0 was *read* or
+    *assumed*. Never trust anything the session asserts about its own tier;
     only a value written to the state file counts."""
-    state_path = os.path.join(config["_project_root"], config["state_path"])
+    path = os.path.join(config["_project_root"], config["state_path"])
+    field = config["trust_tier_field"]
     try:
-        with open(state_path) as f:
-            return int(json.load(f).get(config["trust_tier_field"], 0))
-    except Exception:
-        return 0  # Fail closed: no readable state means the lowest tier.
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return TIER_STATE_MISSING, FALLBACK_TIER, path, ""
+    except ValueError as exc:  # json.JSONDecodeError subclasses ValueError
+        return TIER_STATE_UNREADABLE, FALLBACK_TIER, path, f"invalid JSON: {exc}"
+    except (OSError, UnicodeDecodeError) as exc:
+        return TIER_STATE_UNREADABLE, FALLBACK_TIER, path, \
+            f"{type(exc).__name__}: {exc}"
+    if not isinstance(raw, dict):
+        return TIER_STATE_UNREADABLE, FALLBACK_TIER, path, \
+            f"top level is {type(raw).__name__}, not an object"
+    if field not in raw:
+        return TIER_FIELD_MISSING, FALLBACK_TIER, path, \
+            f"{len(raw)} key(s), none of them {field!r}"
+    value = raw[field]
+    # bool is a subclass of int, so `"trust_tier": true` would otherwise read
+    # as tier 1. A quoted "1" is likewise a config mistake, not a tier -- the
+    # old code coerced it with int() and silently granted the tier. Rejecting
+    # both is a tightening, and tightening is the only safe direction here:
+    # a tier that fails to parse can now only ever block more, never less.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return TIER_FIELD_INVALID, FALLBACK_TIER, path, \
+            f"{field} = {value!r} ({type(value).__name__}), not an integer"
+    return TIER_OK, value, path, ""
+
+
+def load_trust_tier(config):
+    """Just the tier, for callers that do not care whether it was read or
+    assumed. Anything user-facing should use read_trust_tier()."""
+    return read_trust_tier(config)[1]
+
+
+def _state_file_is_protected(path, config):
+    """Whether the state file is one this guard refuses to let the agent
+    write. Checked rather than asserted, because the fix note tells the
+    operator a human has to do it -- and that is only true if we would in
+    fact block the agent from doing it."""
+    rel = os.path.basename(path)
+    return any(rel == os.path.basename(p) for p in config["protected_paths"])
+
+
+def tier_gated_note(state, tier, path, detail, config):
+    """The paragraph appended to every tier-gated block, saying where the tier
+    came from. When the read was clean this is one orienting sentence. When it
+    was not, it says so in as many words: the block may not be a decision
+    about you at all."""
+    min_tier = config["min_tier_for_tier_gated"]
+    field = config["trust_tier_field"]
+    if state == TIER_OK:
+        return (
+            f"This rule is tier-gated: it stops blocking at trust tier "
+            f"{min_tier} and above. Your tier is {tier}, read from {path}. "
+            f"Raising it is a human's decision, not yours -- this guard never "
+            f"writes that file."
+        )
+
+    why = {
+        TIER_STATE_MISSING: f"there is no file at {path}",
+        TIER_STATE_UNREADABLE: f"{path} could not be read ({detail})",
+        TIER_FIELD_MISSING: f"{path} does not contain a {field!r} field "
+                            f"({detail})",
+        TIER_FIELD_INVALID: f"{path} has {detail}",
+    }[state]
+
+    fix = (
+        f"A human has to create or fix that file -- the agent cannot, because "
+        f"it is a protected path this guard refuses to let the agent write."
+        if _state_file_is_protected(path, config) else
+        f"Fix that file and the block goes away on its own."
+    )
+    first_run = (
+        " If you installed this as a plugin, note that a plugin install "
+        "writes no state file into your project; this is expected on first "
+        "run, not a bug."
+        if state == TIER_STATE_MISSING else ""
+    )
+
+    return (
+        f"YOUR TRUST TIER WAS NOT READ -- IT WAS ASSUMED. This rule is "
+        f"tier-gated and stops blocking at tier {min_tier}, but {why}, so the "
+        f"guard fell back to tier {tier} and blocked.\n\n"
+        f"The fallback is deliberate and is not going to change: a tier the "
+        f"guard cannot read has to fail closed. But it does mean this block "
+        f"may not be a policy decision about you -- it may be an "
+        f"installation or config problem wearing the same message."
+        f"{first_run} {fix} `verify.py --target <project>` reports the same "
+        f"state outside of a block."
+    )
 
 
 # The states the git-push allowlist can be in. They are not the same thing
@@ -677,9 +787,14 @@ def record_heartbeat(config, payload, tool_name, decision, rule_id):
         pass  # Never let bookkeeping failure change a decision.
 
 
-def log_block(rule_id, tool_name, text, tier, config):
+def log_block(rule_id, tool_name, text, tier, config, tier_state=TIER_OK):
     """Record the block as evidence. The agent turns it into a formal request
-    with approve.py; this log is the audit trail a human can review."""
+    with approve.py; this log is the audit trail a human can review.
+
+    `trust_tier_source` is logged alongside the tier for the same reason the
+    block message names it: a 0 that was assumed because the state file was
+    missing is a different audit fact from a 0 that was read, and an evidence
+    trail that cannot tell them apart is overstating what it knows."""
     redacted = "[REDACTED -- credential material]" if rule_id == "KEY_MATERIAL" \
         else text[:500]
     entry = {
@@ -688,6 +803,7 @@ def log_block(rule_id, tool_name, text, tier, config):
         "tool": tool_name,
         "attempted": redacted,
         "trust_tier_at_block": tier,
+        "trust_tier_source": "read" if tier_state == TIER_OK else tier_state,
     }
     log_path = os.path.join(config["_project_root"], config["blocked_log"])
     try:
@@ -705,7 +821,7 @@ def evaluate(payload, config):
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
     text = flatten(tool_input)
-    tier = load_trust_tier(config)
+    tier_state, tier, tier_path, tier_detail = read_trust_tier(config)
 
     hit = check_protected_write(tool_name, tool_input, config)
     if not hit:
@@ -722,9 +838,15 @@ def evaluate(payload, config):
     if not hit and tier < config["min_tier_for_tier_gated"]:
         for rule in config["tier_gated_rules"]:
             if re.search(rule["pattern"], text, re.IGNORECASE):
-                hit = (rule["id"], rule["explanation"])
+                # The rule's own explanation says why the action needs
+                # approval. The note says where the tier that gated it came
+                # from -- which is the half the operator could not previously
+                # see, and the half that is wrong when the state file is.
+                note = tier_gated_note(
+                    tier_state, tier, tier_path, tier_detail, config)
+                hit = (rule["id"], rule["explanation"] + "\n\n" + note)
                 break
-    return hit, tool_name, text, tier
+    return hit, tool_name, text, tier, tier_state
 
 
 def main():
@@ -745,7 +867,7 @@ def main():
     # if you would rather a broken guard let work continue.
     try:
         config = load_config()
-        hit, tool_name, text, tier = evaluate(payload, config)
+        hit, tool_name, text, tier, tier_state = evaluate(payload, config)
         record_heartbeat(config, payload, tool_name, "block" if hit else "allow",
                          hit[0] if hit else None)
     except SystemExit:
@@ -772,7 +894,7 @@ def main():
         sys.exit(0)
 
     rule_id, explanation = hit
-    log_block(rule_id, tool_name, text, tier, config)
+    log_block(rule_id, tool_name, text, tier, config, tier_state)
 
     print(
         f"BLOCKED BY APPROVAL GATE [{rule_id}]\n\n"

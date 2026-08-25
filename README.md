@@ -273,6 +273,28 @@ Don't put a token in that URL to make credentials work. A literal secret in a
 command string trips the `SECRET_IN_COMMAND` rule, also correctly; use a
 credential helper or an environment-backed one instead.
 
+**Why does it say tier 0?** The same distinction, one rule over. Tier-gated
+rules block below `min_tier_for_tier_gated`, and the tier is read from your
+state file on every call — the guard never trusts anything the session claims
+about its own tier. Five things can happen when it reads that file, and four
+of them produce tier 0:
+
+| State | What it means | Fix |
+|---|---|---|
+| Tier **read** | The file parsed and the field is an integer. This is a decision about you. | Raise the tier — a human edits the state file. |
+| State file **missing** | No file. Nothing was read. | A human creates it. Expected on a fresh plugin install, which writes no state. |
+| State file **unreadable** | Bad JSON, bad permissions, or a top-level array instead of an object. | Fix the file; the block clears itself. |
+| Tier field **absent** | The file parses fine and simply has no tier field in it. | Add the field. |
+| Tier field **not an integer** | `"trust_tier": "1"` or `true`. A quoted tier is a config mistake, not tier 1. | Make it an integer. |
+
+Tier 0 is the correct *behaviour* in all four failure rows — a tier the guard
+cannot read has to fail closed, and that is not configurable. But the block
+message now says whether that 0 was **read or assumed**, because only the
+first row is a policy decision about you; the rest are install or config
+problems wearing the same message. `verify.py` reports the same five states as
+one `WIRING` row, and `blocked.jsonl` records `trust_tier_source` next to the
+tier so an audit trail cannot mistake an assumed 0 for an observed one.
+
 No dependencies beyond the Python 3 standard library.
 
 ## Verify it's actually live
@@ -295,7 +317,7 @@ WIRING -- approval gate
   PASS  hook registered in .claude/settings.json        env GATE_GUARD_CONFIG="..." python3 ".../bin/gate_guard.py"
   PASS  hook script exists at the registered path       /p/bin/gate_guard.py
   PASS  config resolves (via hook command)              /p/gate-guard.config.json
-  PASS  state file readable                             agent-state.json, trust tier 0
+  PASS  trust tier readable                             agent-state.json, trust tier 0 (unlocks at 1; tier-gated rules are ON)
   WARN  git push allowlist present                      file exists but lists 0 remotes -- every git push is blocked, same as if it were missing
 
 BEHAVIOR -- approval gate

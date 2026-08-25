@@ -459,5 +459,87 @@ class AllowlistRowTests(unittest.TestCase):
         self.assertIn("1 approved remote", detail)
 
 
+class TrustTierRowTests(unittest.TestCase):
+    """A state file with no trust-tier field in it behaves exactly like a
+    missing one: the guard assumes 0 and every tier-gated rule blocks.
+    Reporting `PASS ... trust tier 0` because the file parsed is the same
+    failure AllowlistRowTests exists to prevent, one row up."""
+
+    NAME = "STATE.json"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, self.NAME)
+
+    def row(self, config=None):
+        return verify.trust_tier_row(self.path, self.NAME, config or {})
+
+    def write(self, text):
+        with open(self.path, "w") as f:
+            f.write(text)
+
+    def test_missing_state_file_warns_and_says_it_was_assumed(self):
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("not found", detail)
+        self.assertIn("ASSUMED", detail)
+        self.assertIn("plugin install", detail)
+
+    def test_a_real_tier_zero_passes(self):
+        self.write(json.dumps({"trust_tier": 0}))
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.PASS)
+        self.assertIn("trust tier 0", detail)
+        self.assertIn("tier-gated rules are ON", detail)
+
+    def test_missing_field_warns_rather_than_passing_as_tier_zero(self):
+        self.write(json.dumps({"phase": "build"}))
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("no trust-tier field", detail)
+        self.assertNotIn("trust tier 0", detail)
+
+    def test_malformed_json_warns_without_claiming_the_file_is_absent(self):
+        self.write("{not json,")
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("invalid JSON", detail)
+        self.assertNotIn("not found", detail)
+
+    def test_a_quoted_tier_does_not_read_as_a_granted_tier(self):
+        self.write(json.dumps({"trust_tier": "1"}))
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("not an integer", detail)
+
+    def test_a_tier_above_the_threshold_says_the_rules_are_off(self):
+        self.write(json.dumps({"trust_tier": 2}))
+        status, _, detail = self.row()
+        self.assertEqual(status, verify.PASS)
+        self.assertIn("tier-gated rules are OFF", detail)
+
+    def test_config_can_rename_the_tier_field(self):
+        self.write(json.dumps({"tier": 1}))
+        status, _, detail = self.row({"trust_tier_field": "tier"})
+        self.assertEqual(status, verify.PASS)
+        self.assertIn("trust tier 1", detail)
+
+    def test_read_trust_tier_matches_the_guards_fallback(self):
+        """Whatever the state, the number handed to the probe logic is the
+        same 0 the guard would use -- the row's job is the label, not the
+        behaviour."""
+        for content in (None, "{not json,", "[]", '{"phase":"x"}',
+                        '{"trust_tier":"1"}'):
+            if content is None:
+                if os.path.exists(self.path):
+                    os.remove(self.path)
+            else:
+                self.write(content)
+            state, tier, _detail = verify.read_trust_tier(self.path, {})
+            self.assertEqual(tier, 0, content)
+            self.assertNotEqual(state, verify.TIER_OK, content)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
