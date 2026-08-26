@@ -220,34 +220,198 @@ WRITE_TOOL_NAMES = ("Write", "Edit", "NotebookEdit")
 SHELL_TOOL_NAME = "Bash"
 
 
-def find_config_path():
+CONFIG_FILENAME = "gate-guard.config.json"
+
+
+def config_search_paths():
+    """Every location a config is looked for, in order, as (path, origin).
+
+    Returned rather than inlined so the "no config found" message can name
+    the places it looked. An operator whose file is one directory up cannot
+    act on "no config found"; they can act on a list of three paths.
+    """
+    paths = []
     env_path = os.environ.get("GATE_GUARD_CONFIG")
-    if env_path and os.path.isfile(env_path):
-        return env_path
-    cwd_path = os.path.join(os.getcwd(), "gate-guard.config.json")
-    if os.path.isfile(cwd_path):
-        return cwd_path
+    if env_path:
+        paths.append((env_path, "$GATE_GUARD_CONFIG"))
+    paths.append((os.path.join(os.getcwd(), CONFIG_FILENAME),
+                  "working directory"))
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    local_path = os.path.join(script_dir, "gate-guard.config.json")
-    if os.path.isfile(local_path):
-        return local_path
+    paths.append((os.path.join(script_dir, CONFIG_FILENAME),
+                  "next to the script"))
+    return paths
+
+
+def find_config_path():
+    for path, _origin in config_search_paths():
+        if os.path.isfile(path):
+            return path
     return None
 
 
-def load_config():
-    """Merge a user config file over DEFAULT_CONFIG. Missing keys fall back
-    to the default so a config only needs to override what it changes."""
+# The states a config read can be in. Same defect class as the trust tier and
+# the push allowlist, one layer further out: `except Exception:` wrote one
+# line to stderr and then ran on built-in defaults, which reports A CONFIG
+# THAT WAS NEVER APPLIED exactly like one that was. Running on defaults is the
+# right *behaviour* in every one of these states and does not change here --
+# but "you have no config file", "your config file has a syntax error", and
+# "your config file is fine except the key you care about is misspelled" are
+# three different things to fix, and the guard used to say the same nothing
+# about all three. Stderr from a PreToolUse hook is also not a place an
+# operator reliably looks; the block message is.
+CONFIG_OK = "ok"
+CONFIG_NONE = "no_config"
+CONFIG_UNREADABLE = "unreadable"
+CONFIG_NOT_OBJECT = "not_object"
+CONFIG_UNKNOWN_KEYS = "unknown_keys"
+
+# Keys that live in gate-guard.config.json but are read by a SIBLING tool in
+# the same install, not by this guard. Without this list an unknown-key check
+# flags six keys in our own shipped example config as typos. Measured against
+# the tools rather than assumed -- grep each name in the file named beside it
+# before changing this. Keep in step when a sibling learns a new key.
+SIBLING_CONFIG_KEYS = {
+    "approval_tiers": "approve.py",
+    "decisions_path": "approve.py",
+    "queue_path": "approve.py",
+    "immutable_fields": "state.py",
+    "ledger_path": "state.py",
+    "trust_threshold_usd": "state.py",
+}
+
+# Config keys whose value is a LIST OF RULES. Setting one in a user config
+# REPLACES the built-in list outright -- it does not extend it -- because the
+# merge is a one-level dict.update(). That is a defensible merge semantic and
+# it is not being changed here: a user who wants to drop a built-in rule needs
+# some way to do it. What is not defensible is doing it silently, which is how
+# a project ends up enforcing four rules while believing it enforces nine.
+RULE_LIST_KEYS = ("absolute_rules", "tier_gated_rules", "secret_patterns",
+                  "protected_paths")
+
+
+def unknown_config_keys(user):
+    """Keys in a user config that nothing in this install reads.
+
+    Underscore-prefixed keys are exempt: JSON has no comments, and the
+    shipped budget-guard example already uses `_comment` for exactly that,
+    so treating them as typos would flag our own documented convention.
+    """
+    if not isinstance(user, dict):
+        return []
+    known = set(DEFAULT_CONFIG) | set(SIBLING_CONFIG_KEYS)
+    return sorted(k for k in user
+                  if not k.startswith("_") and k not in known)
+
+
+def replaced_rule_lists(user):
+    """Rule lists the user config replaces wholesale, as
+    (key, builtin_count, user_count, dropped). `dropped` names the built-in
+    entries that are gone -- rule ids where the entries are rule objects,
+    literal values where they are strings."""
+    out = []
+    if not isinstance(user, dict):
+        return out
+    for key in RULE_LIST_KEYS:
+        if key not in user or not isinstance(user[key], list):
+            continue
+        builtin = DEFAULT_CONFIG.get(key) or []
+
+        def label(entry):
+            return entry.get("id", "?") if isinstance(entry, dict) else entry
+
+        kept = {label(e) for e in user[key]}
+        dropped = [label(e) for e in builtin if label(e) not in kept]
+        out.append((key, len(builtin), len(user[key]), dropped))
+    return out
+
+
+def read_config():
+    """Read the config from disk. Returns (state, config, path, detail).
+
+    `config` is always usable -- built-in defaults merged under whatever
+    parsed -- so the decision path can ignore `state` entirely and behave
+    exactly as it did before. `state` exists so the operator can be told
+    whether the rules that just blocked them are the rules they wrote.
+    """
     config = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     path = find_config_path()
-    if path:
+    state, detail = CONFIG_OK, ""
+    if path is None:
+        state = CONFIG_NONE
+        detail = "; ".join(f"{origin}: {p}"
+                           for p, origin in config_search_paths())
+    else:
         try:
             with open(path) as f:
                 user = json.load(f)
+        except ValueError as exc:  # json.JSONDecodeError subclasses ValueError
+            state, user = CONFIG_UNREADABLE, None
+            detail = f"invalid JSON: {exc}"
+        except (OSError, UnicodeDecodeError) as exc:
+            state, user = CONFIG_UNREADABLE, None
+            detail = f"{type(exc).__name__}: {exc}"
+        if state == CONFIG_OK and not isinstance(user, dict):
+            state, detail = CONFIG_NOT_OBJECT, \
+                f"top level is {type(user).__name__}, not an object"
+            user = None
+        if user is not None:
             config.update(user)
-        except Exception as e:
-            sys.stderr.write(f"gate_guard: failed to load {path}: {e}\n")
+            unknown = unknown_config_keys(user)
+            if unknown:
+                state = CONFIG_UNKNOWN_KEYS
+                detail = ", ".join(unknown)
     config["_project_root"] = os.path.dirname(path) if path else os.getcwd()
-    return config
+    config["_config_state"] = state
+    config["_config_path"] = path
+    config["_config_detail"] = detail
+    return state, config, path, detail
+
+
+def load_config():
+    """Just the merged config, for callers that do not care where it came
+    from. Anything user-facing should use read_config()."""
+    return read_config()[1]
+
+
+def config_note(config):
+    """The paragraph appended to a block message when the config the guard
+    ran on is not the config the operator thinks they wrote. Returns "" when
+    the file was found, parsed, and had no keys nothing reads -- there is no
+    warning to give in that case and adding one to every block would train
+    people to skip the whole message."""
+    state = config.get("_config_state", CONFIG_OK)
+    path = config.get("_config_path")
+    detail = config.get("_config_detail", "")
+    if state == CONFIG_OK:
+        return ""
+    if state == CONFIG_NONE:
+        return (
+            f"WHERE THIS RULE CAME FROM: no {CONFIG_FILENAME} was found, so "
+            f"this block came from the guard's BUILT-IN DEFAULTS, not from a "
+            f"file you wrote. Looked in: {detail}. This is expected on a "
+            f"fresh plugin install -- a plugin install writes no config into "
+            f"your project. Run install.py to write one, or set "
+            f"GATE_GUARD_CONFIG. The defaults are deliberately strict, so "
+            f"nothing is unprotected in the meantime."
+        )
+    if state in (CONFIG_UNREADABLE, CONFIG_NOT_OBJECT):
+        return (
+            f"YOUR CONFIG WAS NOT APPLIED: {path} could not be used "
+            f"({detail}). The guard fell back to its BUILT-IN DEFAULTS, so "
+            f"any rule you added in that file is NOT being enforced right "
+            f"now, and any rule you relaxed is still on -- which is why you "
+            f"may be seeing this block at all. This is not a decision about "
+            f"your configuration; the guard never read it. Fix the file and "
+            f"run verify.py."
+        )
+    return (
+        f"CHECK THIS BEFORE YOU CHECK THE RULE: your config at {path} was "
+        f"applied, but it contains {len(detail.split(', '))} key(s) that "
+        f"nothing in this install reads: {detail}. A misspelled key is "
+        f"silently ignored, so the setting you meant to change is still at "
+        f"its default -- and a default you believed you had overridden is a "
+        f"plausible cause of this block. Run verify.py for the full list."
+    )
 
 
 # The states a trust-tier read can be in. Same defect class as the allowlist
@@ -794,7 +958,12 @@ def log_block(rule_id, tool_name, text, tier, config, tier_state=TIER_OK):
     `trust_tier_source` is logged alongside the tier for the same reason the
     block message names it: a 0 that was assumed because the state file was
     missing is a different audit fact from a 0 that was read, and an evidence
-    trail that cannot tell them apart is overstating what it knows."""
+    trail that cannot tell them apart is overstating what it knows.
+
+    `config_source` is there for the same reason one level up. A block
+    produced by a config that failed to parse was produced by the built-in
+    defaults, and an audit trail that presents it as enforcement of the
+    project's own written policy is claiming something that did not happen."""
     redacted = "[REDACTED -- credential material]" if rule_id == "KEY_MATERIAL" \
         else text[:500]
     entry = {
@@ -804,6 +973,7 @@ def log_block(rule_id, tool_name, text, tier, config, tier_state=TIER_OK):
         "attempted": redacted,
         "trust_tier_at_block": tier,
         "trust_tier_source": "read" if tier_state == TIER_OK else tier_state,
+        "config_source": config.get("_config_state", CONFIG_OK),
     }
     log_path = os.path.join(config["_project_root"], config["blocked_log"])
     try:
@@ -896,9 +1066,13 @@ def main():
     rule_id, explanation = hit
     log_block(rule_id, tool_name, text, tier, config, tier_state)
 
+    # Empty whenever the config was found, parsed, and fully recognised --
+    # which is the normal case, so the normal message is unchanged.
+    note = config_note(config)
     print(
         f"BLOCKED BY APPROVAL GATE [{rule_id}]\n\n"
         f"{explanation}\n\n"
+        + (note + "\n\n" if note else "") +
         f"This block is logged to {config['blocked_log']}. Do not retry it, "
         f"do not work around it, and do not attempt to disable this hook. If "
         f"you genuinely need it, file a request with approve.py request so a "

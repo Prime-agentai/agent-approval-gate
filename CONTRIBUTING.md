@@ -46,13 +46,13 @@ Not because these are bad ideas — because they change what the project is:
 
 ## Before you open a pull request
 
-Run the suite. All seven files, all 298 cases, no arguments, no test runner:
+Run the suite. All seven files, all 353 cases, no arguments, no test runner:
 
 ```bash
-python3 tests/test_gate_guard.py    # 85 cases, rule-pack behavior
+python3 tests/test_gate_guard.py    # 124 cases, rule pack + the three state machines
 python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
-python3 tests/test_verify.py        # 53 cases, incl. mutation tests on verify.py
+python3 tests/test_verify.py        # 69 cases, incl. mutation tests on verify.py
 python3 tests/test_demo.py          # 32 cases, front-door demo end to end
 python3 tests/test_heartbeat.py     # 56 cases, liveness, --live and --evidence
 python3 tests/test_over_blocks.py   # 21 cases, over-block rate accounting

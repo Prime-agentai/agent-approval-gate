@@ -295,6 +295,34 @@ problems wearing the same message. `verify.py` reports the same five states as
 one `WIRING` row, and `blocked.jsonl` records `trust_tier_source` next to the
 tier so an audit trail cannot mistake an assumed 0 for an observed one.
 
+**Are these even your rules?** The same distinction again, one layer further
+out — and this one is the quietest, because nothing blocks and nothing looks
+wrong. The guard merges `gate-guard.config.json` over its built-in defaults,
+and if that merge does not happen the defaults run anyway. Five states:
+
+| State | What it means | Fix |
+|---|---|---|
+| Config **read** | Found, parsed, every key recognised. Your rules are in force. | — |
+| **No config file** | None at any of the three search paths. The built-in defaults are running, not your rules. | Run `install.py`, or set `GATE_GUARD_CONFIG`. Expected on a fresh plugin install, which writes no config. |
+| Config **unreadable** | Bad JSON, bad permissions. **Your file was not applied at all** — any rule you added is not being enforced. | Fix the file. |
+| Config **not an object** | Top level is a list or a string. Same consequence as unreadable. | Make it an object. |
+| **Unknown keys** | The file applied, but some keys are read by nothing. A misspelled key is silently ignored, so the setting you meant to change is still at its default. | Fix the spelling — `verify.py` names the key it thinks you meant. |
+
+The defaults are deliberately strict, so none of these leave you unprotected
+— but the last three mean the gate you are running is not the gate you wrote,
+and the old behaviour was one line on stderr, which a `PreToolUse` hook is not
+a reliable place to read. Any block produced in a non-OK state now says so in
+the block message, and `blocked.jsonl` records `config_source` beside
+`trust_tier_source`.
+
+**The failure mode worth knowing about even if you never hit the others:** a
+rule list in your config **replaces** the built-in one, it does not extend it.
+Adding one `absolute_rules` entry of your own silently removes all five
+shipped rules — including `KEY_MATERIAL` and `FUND_MOVEMENT` — and everything
+kept reporting `PASS`. `verify.py` now has a `built-in rules preserved` row
+that names each dropped rule id. It is a `WARN`, not a `FAIL`: replacing the
+pack is a legitimate thing to want. Silently replacing it is not.
+
 No dependencies beyond the Python 3 standard library.
 
 ## Verify it's actually live
@@ -317,6 +345,8 @@ WIRING -- approval gate
   PASS  hook registered in .claude/settings.json        env GATE_GUARD_CONFIG="..." python3 ".../bin/gate_guard.py"
   PASS  hook script exists at the registered path       /p/bin/gate_guard.py
   PASS  config resolves (via hook command)              /p/gate-guard.config.json
+  PASS  every config key is read by something           13 key(s), all recognised
+  PASS  built-in rules preserved                        1 list(s) overridden, 0 built-in entries dropped
   PASS  trust tier readable                             agent-state.json, trust tier 0 (unlocks at 1; tier-gated rules are ON)
   WARN  git push allowlist present                      file exists but lists 0 remotes -- every git push is blocked, same as if it were missing
 
@@ -925,24 +955,34 @@ All three scripts share one config file. See
 | `rule_requires` | `verify.py --over-blocks` | Optional: `{"YOUR_RULE": "exec"\|"persist"}` — what the action behind each of your rules needs in order to happen. Merges over the defaults; undeclared rules are excluded from the analysis, not assumed correct |
 | `tool_capabilities` | `verify.py --over-blocks` | Optional: `{"YourTool": ["exec", "persist"]}` — what each tool your harness exposes is physically able to do. `[]` means it can do neither. Undeclared tools are excluded, not assumed harmless |
 
-`absolute_rules` and `tier_gated_rules` in the config file, if present,
-**replace** the built-in defaults in `gate_guard.py` rather than merge with
-them — copy the defaults out of `gate_guard.py`'s `DEFAULT_CONFIG` first if
-you want to extend rather than replace.
+`absolute_rules`, `tier_gated_rules`, `secret_patterns` and `protected_paths`
+in the config file, if present, **replace** the built-in defaults in
+`gate_guard.py` rather than merge with them — copy the defaults out of
+`gate_guard.py`'s `DEFAULT_CONFIG` first if you want to extend rather than
+replace. `verify.py`'s `built-in rules preserved` row names every built-in
+entry a config drops this way, so you find out from the report rather than
+from a call that should have been blocked and wasn't.
+
+Any key not in the table above and not read by `approve.py` or `state.py` is
+**silently ignored** — `dict.update()` accepts anything. `verify.py` lists
+them under `every config key is read by something` and suggests the key it
+thinks you meant. Keys beginning with `_` are exempt, so you can use them for
+comments, which is what the shipped `budget-guard.config.example.json` does.
 
 ## Testing
 
-`tests/test_gate_guard.py` is a small (13-case) sanity suite that exercises
-the shipped default rule pack directly against `gate_guard.py`'s pure
-decision function — no stdin/stdout plumbing, no subprocess. Run it with:
+`tests/test_gate_guard.py` exercises the shipped default rule pack directly
+against `gate_guard.py`'s pure decision function — no stdin/stdout plumbing,
+no subprocess — plus the config, trust-tier and allowlist state machines that
+decide *what the block message says*. Run it with:
 
 ```bash
-python3 tests/test_gate_guard.py    # 13 cases, rule-pack behavior
+python3 tests/test_gate_guard.py    # 124 cases, rule pack + the three state machines
 python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
-python3 tests/test_verify.py        # 31 cases, incl. mutation tests on verify.py
+python3 tests/test_verify.py        # 69 cases, incl. mutation tests on verify.py
 python3 tests/test_demo.py          # 32 cases, front-door demo end to end
-python3 tests/test_heartbeat.py     # 52 cases, liveness, --live and --evidence
+python3 tests/test_heartbeat.py     # 56 cases, liveness, --live and --evidence
 python3 tests/test_over_blocks.py   # 21 cases, over-block analysis
 ```
 

@@ -263,16 +263,30 @@ def wired_guard_path(command, target):
     return guard if os.path.isabs(guard) else os.path.join(target, guard)
 
 
-def resolve_config(command, target):
+def resolve_config(command, target, guard_path=None):
     """Resolve the config exactly the way gate_guard.py will: the env var in
-    the hook command first, then the project root."""
+    the hook command first, then the project root, then next to the script.
+
+    The script-dir fallback matches gate_guard.find_config_path() and
+    resolve_budget_config(); without it this reported "not found -- running on
+    defaults" for a plugin-style install whose config sits beside the guard,
+    which is the same class of wrong answer everything else in this file
+    exists to stop.
+    """
     m = re.search(r"GATE_GUARD_CONFIG=(\"[^\"]+\"|'[^']+'|\S+)", command)
     if m:
         path = m.group(1).strip("\"'")
         if not os.path.isabs(path):
             path = os.path.join(target, path)
         return path, "hook command"
-    return os.path.join(target, "gate-guard.config.json"), "project root"
+    root_path = os.path.join(target, "gate-guard.config.json")
+    if os.path.isfile(root_path) or not guard_path:
+        return root_path, "project root"
+    beside = os.path.join(os.path.dirname(os.path.abspath(guard_path)),
+                          "gate-guard.config.json")
+    if os.path.isfile(beside):
+        return beside, "next to the script"
+    return root_path, "project root"
 
 
 def check_wiring(target):
@@ -292,21 +306,20 @@ def check_wiring(target):
         rows.append((FAIL, "hook script exists at the registered path",
                      f"not found: {guard}"))
 
-    config_path, origin = resolve_config(command, target)
-    config = None
-    if os.path.isfile(config_path):
-        try:
-            with open(config_path) as f:
-                config = json.load(f)
-            rows.append((PASS, f"config resolves (via {origin})", config_path))
-        except json.JSONDecodeError as e:
-            rows.append((FAIL, f"config resolves (via {origin})",
-                         f"{config_path}: invalid JSON: {e}"))
-    else:
-        rows.append((WARN, f"config resolves (via {origin})",
-                     f"{config_path} not found -- the hook falls back to its "
-                     f"built-in defaults, NOT your rules"))
-    config = config or {}
+    config_path, origin = resolve_config(command, target, guard)
+    row, user = config_row(config_path, origin)
+    rows.append(row)
+    config = user or {}
+
+    # Only meaningful against the guard that is actually installed at
+    # --target: an older guard has a different key set, and reporting a key
+    # it does not know about as a typo would be a fabricated finding.
+    module = load_guard_module(guard, "_gg_keys") if os.path.isfile(guard) \
+        else None
+    for extra in (config_keys_row(user, config_path, module),
+                  rule_coverage_row(user, module)):
+        if extra:
+            rows.append(extra)
 
     state_rel = config.get("state_path", "STATE.json")
     state_abspath = os.path.join(target, state_rel)
@@ -315,6 +328,123 @@ def check_wiring(target):
     rows.append(allowlist_row(target, config))
 
     return rows, command, config, state_abspath
+
+
+def config_row(config_path, origin):
+    """One row describing whether the config on disk is the config the guard
+    will run on. Returns (row, parsed_or_None).
+
+    Mirrors gate_guard.read_config()'s states. The three failure states behave
+    identically -- built-in defaults, every default rule enforced -- and are
+    fixed completely differently, which is the same reason the tier and
+    allowlist rows were split.
+    """
+    label = f"config resolves (via {origin})"
+    if not os.path.isfile(config_path):
+        if os.path.isdir(config_path):
+            return (WARN, label,
+                    f"{config_path} is a directory, not a file -- the hook "
+                    f"falls back to its built-in defaults, NOT your rules"), None
+        return (WARN, label,
+                f"{config_path} not found -- the hook falls back to its "
+                f"built-in defaults, NOT your rules"), None
+    try:
+        with open(config_path) as f:
+            parsed = json.load(f)
+    except ValueError as e:
+        return (FAIL, label,
+                f"{config_path}: invalid JSON: {e} -- the hook falls back to "
+                f"its built-in defaults, so NONE of your rules are in force"), None
+    except (OSError, UnicodeDecodeError) as e:
+        return (FAIL, label,
+                f"{config_path}: {type(e).__name__}: {e} -- the hook falls "
+                f"back to its built-in defaults, so NONE of your rules are in "
+                f"force"), None
+    if not isinstance(parsed, dict):
+        return (FAIL, label,
+                f"{config_path}: top level is {type(parsed).__name__}, not an "
+                f"object -- the hook falls back to its built-in defaults, so "
+                f"NONE of your rules are in force"), None
+    return (PASS, label, config_path), parsed
+
+
+def config_keys_row(user, config_path, module):
+    """One row for keys the config sets that nothing in the install reads.
+
+    A misspelled key is not an error anywhere: `dict.update()` accepts it,
+    the guard ignores it, and the setting the operator meant to change stays
+    at its default until a call they expected to be blocked isn't. This is
+    the only place that ever says so.
+
+    Returns None -- rather than a PASS -- when there is no config to check or
+    the installed guard is too old to declare its sibling keys, because a
+    check that cannot run must not print a row that looks like it did.
+    """
+    if not user or module is None:
+        return None
+    if not hasattr(module, "unknown_config_keys"):
+        return None
+    unknown = module.unknown_config_keys(user)
+    label = "every config key is read by something"
+    if not unknown:
+        readable = [k for k in user if not k.startswith("_")]
+        return (PASS, label, f"{len(readable)} key(s), all recognised")
+    siblings = getattr(module, "SIBLING_CONFIG_KEYS", {})
+    hint = ""
+    known = sorted(set(getattr(module, "DEFAULT_CONFIG", {})) | set(siblings))
+    near = [(k, close_key(k, known)) for k in unknown]
+    near = [f"{k} (did you mean {n}?)" for k, n in near if n]
+    if near:
+        hint = " " + "; ".join(near)
+    return (WARN, label,
+            f"{config_path} sets {len(unknown)} key(s) nothing reads: "
+            f"{', '.join(unknown)} -- silently ignored, so whatever you meant "
+            f"to set is still at its default.{hint}")
+
+
+def close_key(key, known):
+    """The known key a typo most plausibly meant, or None. Deliberately
+    conservative: a wrong suggestion is worse than none, so it only fires on
+    a single edit-distance-ish match (a shared prefix and a near-equal
+    length), not on a general fuzzy score."""
+    import difflib
+    matches = difflib.get_close_matches(key, known, n=1, cutoff=0.85)
+    return matches[0] if matches else None
+
+
+def rule_coverage_row(user, module):
+    """One row for built-in rules a config silently drops.
+
+    Setting `absolute_rules` in a config REPLACES the built-in list; it does
+    not extend it. A project that adds one rule of its own and expects the
+    other five to still be there is enforcing one rule and believes it is
+    enforcing six. Nothing anywhere reported that before this row.
+
+    Returns None when the config overrides no rule list -- the common case,
+    and a row saying "you dropped nothing" on every run is noise.
+    """
+    if not user or module is None or not hasattr(module, "replaced_rule_lists"):
+        return None
+    replaced = module.replaced_rule_lists(user)
+    dropping = [r for r in replaced if r[3]]
+    label = "built-in rules preserved"
+    if not replaced:
+        return None
+    if not dropping:
+        return (PASS, label,
+                f"{len(replaced)} list(s) overridden, 0 built-in entries "
+                f"dropped")
+    parts = []
+    for key, builtin_n, user_n, dropped in dropping:
+        mine = f"{user_n} entry" if user_n == 1 else f"{user_n} entries"
+        theirs = f"{builtin_n} built-in one" if builtin_n == 1 \
+            else f"{builtin_n} built-in ones"
+        parts.append(f"{key}: your config REPLACES the {theirs} with {mine}, "
+                     f"dropping {', '.join(str(d) for d in dropped)}")
+    return (WARN, label,
+            "; ".join(parts) + " -- a config REPLACES a rule list, it does "
+            "not extend it. If that was deliberate this is fine; if it was "
+            "not, those rules are no longer enforced anywhere.")
 
 
 # Mirrors gate_guard.read_trust_tier()'s states. verify.py deliberately does
@@ -441,24 +571,30 @@ BUDGET_MARKER = "budget_guard.py"
 UNKNOWN_MODEL = "zzz-unreleased-probe-model"
 
 
-def load_budget_module(guard_path):
-    """Import the installed budget_guard.py to reuse its own default config
-    and price table.
+def load_guard_module(guard_path, name):
+    """Import an installed guard to read its own declarations -- default
+    config, price table, key registry.
 
     This is deliberately narrow: nothing here calls its decision functions.
-    Probes still go through the registered command as a subprocess, the same
-    as the gate probes. The import exists so the probe transcripts can be
-    sized against YOUR merged config -- restating the default price table in
-    this file would drift from it the first time either one changed.
+    Probes still go through the registered command as a subprocess. The
+    import exists so this report is sized against the guard that is ACTUALLY
+    INSTALLED at --target, which may be older than this verify.py; restating
+    its tables here would drift the first time either one changed, and would
+    quietly report a newer file's key set against an older guard.
     """
     try:
         import importlib.util
-        spec = importlib.util.spec_from_file_location("_bg_probe", guard_path)
+        spec = importlib.util.spec_from_file_location(name, guard_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
     except Exception:
         return None
+
+
+def load_budget_module(guard_path):
+    """The budget guard, for its default config and price table."""
+    return load_guard_module(guard_path, "_bg_probe")
 
 
 def merge_budget_config(module, user_config):

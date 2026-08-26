@@ -320,9 +320,187 @@ def check_trust_tier_states():
         check("...and a read tier as read", entry["trust_tier_source"] == "read")
 
 
+def _read_config_in(cwd, env_path=None):
+    """read_config() resolves against the process's cwd and environment, so
+    the only honest way to test its states is to actually put it there."""
+    import contextlib
+    prior_cwd = os.getcwd()
+    prior_env = os.environ.get("GATE_GUARD_CONFIG")
+    try:
+        os.chdir(cwd)
+        if env_path is None:
+            os.environ.pop("GATE_GUARD_CONFIG", None)
+        else:
+            os.environ["GATE_GUARD_CONFIG"] = env_path
+        return gate_guard.read_config()
+    finally:
+        os.chdir(prior_cwd)
+        if prior_env is None:
+            os.environ.pop("GATE_GUARD_CONFIG", None)
+        else:
+            os.environ["GATE_GUARD_CONFIG"] = prior_env
+
+
+def check_config_states():
+    """The config read has five states and they used to produce one line on
+    stderr or nothing at all. They behave identically -- built-in defaults --
+    and are fixed completely differently. Each gets its own tmpdir."""
+    config_name = gate_guard.CONFIG_FILENAME
+    pkg = f"{_PKG_MGR} {_PKG_VERB} left-pad"
+
+    # --- no config anywhere: the plugin first-run state --------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        state, config, path, detail = _read_config_in(tmp)
+        check("no config file anywhere reports state 'no_config'",
+              state == gate_guard.CONFIG_NONE and path is None)
+        check("...and still returns a usable config that blocks",
+              call("Bash", {"command": pkg}, config) is not None)
+        none_note = gate_guard.config_note(config)
+        check("...and the note says the block came from built-in defaults",
+              "BUILT-IN DEFAULTS" in none_note)
+        check("...and names every path it looked in, so the fix is actionable",
+              all(p in none_note for p, _ in gate_guard.config_search_paths()))
+        check("...and names the plugin install as the expected way to get here",
+              "plugin install writes no config" in none_note)
+        check("...and does not imply the project is unprotected",
+              "deliberately strict" in none_note)
+
+    # --- unreadable: valid path, invalid JSON ------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, config_name), "w") as f:
+            f.write('{\n  "min_tier_for_tier_gated": 1,\n}\n')  # trailing comma
+        state, config, path, detail = _read_config_in(tmp)
+        check("a config with a syntax error reports state 'unreadable'",
+              state == gate_guard.CONFIG_UNREADABLE)
+        check("...and carries the parser's own error as detail",
+              "invalid JSON" in detail)
+        bad_note = gate_guard.config_note(config)
+        check("...and the note says the file was NOT applied",
+              "YOUR CONFIG WAS NOT APPLIED" in bad_note)
+        check("...and names the file that failed", path in bad_note)
+        check("...and says the block is not a decision about their config",
+              "not a decision about" in bad_note)
+        check("...and is not the same message as the no-config case",
+              bad_note != none_note)
+
+    # --- not an object: parses fine, wrong shape ---------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, config_name), "w") as f:
+            f.write('["protected_paths"]\n')
+        state, config, _, detail = _read_config_in(tmp)
+        check("a config whose top level is a list reports 'not_object'",
+              state == gate_guard.CONFIG_NOT_OBJECT)
+        check("...and says what it found instead of an object",
+              "list, not an object" in detail)
+        check("...and does not crash the guard",
+              call("Bash", {"command": pkg}, config) is not None)
+
+    # --- unknown keys: the silent one --------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, config_name), "w") as f:
+            json.dump({"protected_path": [_STATE_FILE],
+                       "min_tier_for_tier_gate": 1}, f)
+        state, config, path, detail = _read_config_in(tmp)
+        check("a config with misspelled keys reports 'unknown_keys'",
+              state == gate_guard.CONFIG_UNKNOWN_KEYS)
+        check("...and names every key nothing reads",
+              "protected_path" in detail and "min_tier_for_tier_gate" in detail)
+        typo_note = gate_guard.config_note(config)
+        check("...and the note says the ignored key is still at its default",
+              "still at" in typo_note and "default" in typo_note)
+        check("...and the config still applied the keys it did understand",
+              config["state_path"] == gate_guard.DEFAULT_CONFIG["state_path"])
+
+    # --- clean config: no note at all, message unchanged -------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, config_name), "w") as f:
+            json.dump({"min_tier_for_tier_gated": 1}, f)
+        state, config, _, _ = _read_config_in(tmp)
+        check("a clean config reports state 'ok'", state == gate_guard.CONFIG_OK)
+        check("...and adds NO note, so a normal block reads exactly as before",
+              gate_guard.config_note(config) == "")
+        check("load_config() still returns just the merged config",
+              isinstance(config, dict) and "absolute_rules" in config)
+
+    # --- the shipped example config must not trip our own check ------------
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    example = os.path.join(repo, "gate-guard.config.example.json")
+    with open(example) as f:
+        shipped = json.load(f)
+    check("our own example config reports zero unknown keys",
+          gate_guard.unknown_config_keys(shipped) == [])
+    check("...because sibling-tool keys are declared, not guessed",
+          set(shipped) - set(gate_guard.DEFAULT_CONFIG)
+          <= set(gate_guard.SIBLING_CONFIG_KEYS))
+    for key, tool in gate_guard.SIBLING_CONFIG_KEYS.items():
+        with open(os.path.join(repo, tool)) as f:
+            src = f.read()
+        check(f"...and {tool} really does read {key}", key in src)
+    check("underscore-prefixed keys are treated as comments, not typos",
+          gate_guard.unknown_config_keys({"_comment": "hi"}) == [])
+
+    # --- a config that silently drops built-in rules -----------------------
+    replaced = gate_guard.replaced_rule_lists(
+        {"absolute_rules": [{"id": "MINE", "pattern": "x", "explanation": "y"}]})
+    check("overriding a rule list is reported as a replacement",
+          len(replaced) == 1 and replaced[0][0] == "absolute_rules")
+    key, builtin_n, user_n, dropped = replaced[0]
+    check("...with every dropped built-in rule named",
+          user_n == 1 and len(dropped) == builtin_n and "MINE" not in dropped)
+    check("a superset override drops nothing",
+          gate_guard.replaced_rule_lists(
+              {"protected_paths":
+               list(gate_guard.DEFAULT_CONFIG["protected_paths"]) + ["x"]}
+          )[0][3] == [])
+    check("a config that overrides no rule list reports no replacements",
+          gate_guard.replaced_rule_lists({"state_path": "s.json"}) == [])
+
+    # --- the audit log records which config produced the block -------------
+    with tempfile.TemporaryDirectory() as tmp:
+        config = make_config(tmp)
+        config["_config_state"] = gate_guard.CONFIG_UNREADABLE
+        gate_guard.log_block("PACKAGE_INSTALL", "Bash", pkg, 0, config,
+                             gate_guard.TIER_OK)
+        with open(os.path.join(tmp, config["blocked_log"])) as f:
+            entry = json.loads(f.readline())
+        check("blocked.jsonl records a block from an unapplied config",
+              entry["config_source"] == "unreadable")
+
+    # --- and it reaches the operator through the real hook path ------------
+    _check_config_note_reaches_stderr()
+
+
+def _check_config_note_reaches_stderr():
+    """A note the block message does not actually print is a note nobody
+    reads. Run the guard the way the harness does -- a subprocess fed JSON on
+    stdin -- rather than trusting config_note() in isolation."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        guard = os.path.join(tmp, "gate_guard.py")
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "gate_guard.py")) as f:
+            src = f.read()
+        with open(guard, "w") as f:
+            f.write(src)
+        payload = json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command":
+                                             f"{_PKG_MGR} {_PKG_VERB} left-pad"}})
+        env = dict(os.environ)
+        env.pop("GATE_GUARD_CONFIG", None)
+        proc = subprocess.run([sys.executable, guard], input=payload,
+                              capture_output=True, text=True, cwd=tmp, env=env)
+        check("the real hook still exits 2 on a block", proc.returncode == 2)
+        check("...and the config provenance is printed on stderr",
+              "BUILT-IN DEFAULTS" in proc.stderr)
+        check("...alongside the rule's own explanation, not instead of it",
+              "BLOCKED BY APPROVAL GATE" in proc.stderr
+              and "logged to" in proc.stderr)
+
+
 def main():
     check_allowlist_states()
     check_trust_tier_states()
+    check_config_states()
 
     with tempfile.TemporaryDirectory() as tmp:
         config = make_config(tmp)

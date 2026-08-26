@@ -161,6 +161,157 @@ class ResolveBudgetConfigTests(unittest.TestCase):
         self.assertEqual(origin, "built-in defaults")
 
 
+class ConfigRowTests(unittest.TestCase):
+    """The wiring section's job is to say whether the guard is running on the
+    operator's rules. Reporting PASS for a file that failed to parse, or
+    saying nothing at all about a misspelled key, tells them the opposite of
+    what they will experience."""
+
+    def setUp(self):
+        self.target = tempfile.mkdtemp(prefix="verify-cfgrow-")
+        self.addCleanup(shutil.rmtree, self.target, ignore_errors=True)
+        self.path = os.path.join(self.target, "gate-guard.config.json")
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.module = verify.load_guard_module(
+            os.path.join(repo, "gate_guard.py"), "_gg_test")
+        self.assertIsNotNone(self.module, "could not import the shipped guard")
+
+    def write(self, text):
+        with open(self.path, "w") as f:
+            f.write(text)
+
+    def test_a_clean_config_passes_and_is_returned_parsed(self):
+        self.write(json.dumps({"min_tier_for_tier_gated": 2}))
+        (status, _label, _detail), parsed = verify.config_row(
+            self.path, "project root")
+        self.assertEqual(status, verify.PASS)
+        self.assertEqual(parsed["min_tier_for_tier_gated"], 2)
+
+    def test_invalid_json_fails_and_says_no_rules_are_in_force(self):
+        self.write('{"min_tier_for_tier_gated": 1,}')
+        (status, _label, detail), parsed = verify.config_row(
+            self.path, "project root")
+        self.assertEqual(status, verify.FAIL)
+        self.assertIsNone(parsed)
+        self.assertIn("NONE of your rules are in force", detail)
+
+    def test_a_top_level_list_fails_rather_than_crashing(self):
+        self.write('["protected_paths"]')
+        (status, _label, detail), parsed = verify.config_row(
+            self.path, "project root")
+        self.assertEqual(status, verify.FAIL)
+        self.assertIsNone(parsed)
+        self.assertIn("not an object", detail)
+
+    def test_a_directory_in_the_configs_place_is_not_reported_as_missing(self):
+        os.mkdir(self.path)
+        (status, _label, detail), _ = verify.config_row(self.path, "project root")
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("is a directory", detail)
+
+    def test_missing_config_warns_that_the_defaults_are_running(self):
+        (status, _label, detail), parsed = verify.config_row(
+            self.path, "project root")
+        self.assertEqual(status, verify.WARN)
+        self.assertIsNone(parsed)
+        self.assertIn("NOT your rules", detail)
+
+    def test_a_misspelled_key_is_reported_with_the_key_it_meant(self):
+        user = {"protected_path": ["STATE.json"]}
+        status, _label, detail = verify.config_keys_row(
+            user, self.path, self.module)
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("protected_path", detail)
+        self.assertIn("did you mean protected_paths?", detail)
+
+    def test_a_key_a_sibling_tool_reads_is_not_called_a_typo(self):
+        user = {"queue_path": "approvals/queue.jsonl", "ledger_path": "l.jsonl"}
+        status, _label, _detail = verify.config_keys_row(
+            user, self.path, self.module)
+        self.assertEqual(status, verify.PASS)
+
+    def test_the_shipped_example_config_produces_no_warning(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, "gate-guard.config.example.json")) as f:
+            shipped = json.load(f)
+        status, _label, _detail = verify.config_keys_row(
+            shipped, self.path, self.module)
+        self.assertEqual(status, verify.PASS)
+
+    def test_no_row_at_all_when_the_installed_guard_cannot_declare_its_keys(self):
+        # An older guard at --target has a different key set. Guessing at it
+        # would print a fabricated typo warning, so the row is skipped.
+        class OldGuard:
+            pass
+        self.assertIsNone(
+            verify.config_keys_row({"whatever": 1}, self.path, OldGuard()))
+        self.assertIsNone(verify.config_keys_row({}, self.path, self.module))
+
+    def test_replacing_a_rule_list_warns_and_names_the_dropped_rules(self):
+        user = {"absolute_rules": [
+            {"id": "MINE", "pattern": "x", "explanation": "y"}]}
+        status, _label, detail = verify.rule_coverage_row(user, self.module)
+        self.assertEqual(status, verify.WARN)
+        self.assertIn("REPLACES", detail)
+        for rule in self.module.DEFAULT_CONFIG["absolute_rules"]:
+            self.assertIn(rule["id"], detail)
+
+    def test_a_superset_override_passes(self):
+        user = {"protected_paths":
+                list(self.module.DEFAULT_CONFIG["protected_paths"]) + ["x.md"]}
+        status, _label, _detail = verify.rule_coverage_row(user, self.module)
+        self.assertEqual(status, verify.PASS)
+
+    def test_no_row_when_no_rule_list_is_overridden(self):
+        self.assertIsNone(
+            verify.rule_coverage_row({"state_path": "s.json"}, self.module))
+
+
+class ResolveGateConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.target = tempfile.mkdtemp(prefix="verify-gatecfg-")
+        self.addCleanup(shutil.rmtree, self.target, ignore_errors=True)
+
+    def test_env_assignment_in_the_command_wins(self):
+        path, origin = verify.resolve_config(
+            'env GATE_GUARD_CONFIG="/x/c.json" python3 /g.py', self.target)
+        self.assertEqual(path, "/x/c.json")
+        self.assertEqual(origin, "hook command")
+
+    def test_project_root_wins_over_the_script_directory(self):
+        expected = os.path.join(self.target, "gate-guard.config.json")
+        with open(expected, "w") as f:
+            f.write("{}")
+        beside = os.path.join(self.target, "vendor")
+        os.makedirs(beside)
+        with open(os.path.join(beside, "gate-guard.config.json"), "w") as f:
+            f.write("{}")
+        path, origin = verify.resolve_config(
+            "python3 vendor/gate_guard.py", self.target,
+            os.path.join(beside, "gate_guard.py"))
+        self.assertEqual(path, expected)
+        self.assertEqual(origin, "project root")
+
+    def test_a_config_beside_the_script_is_found_the_way_the_guard_finds_it(self):
+        beside = os.path.join(self.target, "vendor")
+        os.makedirs(beside)
+        expected = os.path.join(beside, "gate-guard.config.json")
+        with open(expected, "w") as f:
+            f.write("{}")
+        path, origin = verify.resolve_config(
+            "python3 vendor/gate_guard.py", self.target,
+            os.path.join(beside, "gate_guard.py"))
+        self.assertEqual(path, expected)
+        self.assertEqual(origin, "next to the script")
+
+    def test_nothing_anywhere_still_reports_the_project_root(self):
+        path, origin = verify.resolve_config(
+            "python3 /g.py", self.target, "/g.py")
+        self.assertEqual(path,
+                         os.path.join(self.target, "gate-guard.config.json"))
+        self.assertEqual(origin, "project root")
+
+
 class WritableTests(unittest.TestCase):
     def test_reports_false_for_a_read_only_directory(self):
         if os.geteuid() == 0:
