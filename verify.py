@@ -327,7 +327,54 @@ def check_wiring(target):
 
     rows.append(allowlist_row(target, config))
 
+    rows.extend(recording_rows(target, command, config))
+
     return rows, command, config, state_abspath
+
+
+def recording_rows(target, command, config):
+    """Can the guard write down what it did?
+
+    The budget half of this file has had these two rows since it shipped. The
+    gate half never did, and the gate half is the one whose product claim is
+    evidence. gate_guard.py swallows every bookkeeping failure by design -- so
+    an unwritable approvals/ directory produces a guard that blocks correctly
+    and records nothing, and --evidence then reports it as a control that never
+    ran. This is the check that catches that before an auditor does.
+
+    Severity is deliberately split. A heartbeat that cannot be written can
+    never establish that the control operated, so it is a FAIL. A block log
+    that cannot be written still leaves enforcement fully intact -- what is
+    lost is the audit trail -- so it is a WARN, matching check_budget_wiring.
+    """
+    rows = []
+    hb = heartbeat_path(target, command, config)
+    if not hb:
+        rows.append((WARN, "heartbeat directory writable",
+                     "heartbeat_path is disabled in your config -- liveness "
+                     "and evidence cannot be established for this install"))
+    elif writable(os.path.dirname(hb) or "."):
+        rows.append((PASS, "heartbeat directory writable", os.path.dirname(hb)))
+    else:
+        rows.append((FAIL, "heartbeat directory writable",
+                     f"{os.path.dirname(hb)} is not writable -- the guard "
+                     f"still blocks, but it cannot record that it ran and "
+                     f"--evidence will report it as never having run"))
+
+    log = project_path(target, command, config, "blocked_log",
+                       "approvals/blocked.jsonl")
+    if not log:
+        rows.append((WARN, "blocked-log directory writable",
+                     "blocked_log is disabled in your config -- blocks are "
+                     "enforced but nothing is written down"))
+    elif writable(os.path.dirname(log) or "."):
+        rows.append((PASS, "blocked-log directory writable", os.path.dirname(log)))
+    else:
+        rows.append((WARN, "blocked-log directory writable",
+                     f"{os.path.dirname(log)} is not writable -- blocks still "
+                     f"happen and still stop the call, but no audit trail "
+                     f"accumulates and --evidence will show zero of them"))
+    return rows
 
 
 def config_row(config_path, origin):
@@ -1069,6 +1116,30 @@ NEVER_RAN = """
 """
 
 
+CANNOT_RECORD = """
+  Liveness CANNOT BE ESTABLISHED, and that is a different finding from
+  "the hook never ran". Do not read it as one, and do not start debugging
+  your settings.json over it.
+
+    {detail}
+
+  The guard swallows every bookkeeping failure on purpose: a hook that
+  crashed while writing its own record would turn a block into an allow,
+  which is worse than losing the record. The cost of that choice is this
+  exact ambiguity -- from the outside, a gate that is blocking correctly
+  and cannot write its heartbeat looks the same as one the harness has
+  never called.
+
+  This check will not guess between them. Fix the path above, make one
+  ordinary tool call, and re-run: if the heartbeat appears with a high
+  invocation count, the gate was working the whole time.
+
+  Until then, --evidence for this project reports NOT ESTABLISHED. That
+  is honest -- there is no operating record to hand anyone -- but it is a
+  statement about the record, not about the control.
+"""
+
+
 SUBAGENT_UNPROVEN = """
   Subagent coverage is UNPROVEN, which is not the same as broken.
 
@@ -1133,6 +1204,45 @@ def subagent_row(hb, matcher=None):
     return (WARN, "subagent coverage", detail)
 
 
+def classify_missing_heartbeat(hb_path, exc):
+    """Why is there no readable heartbeat? Returns (stop_kind, detail).
+
+    Until now every answer to this question was "never-ran", and that is a
+    claim about the HARNESS -- that it has not once invoked the hook. It is
+    the strongest negative finding this tool prints, and it was being printed
+    for at least three situations that do not support it:
+
+      * The file exists but cannot be read. Something wrote it, so the guard
+        ran; only this reader is locked out.
+      * The file exists and is corrupt. Same -- a truncated write is still a
+        write, and the counter it destroyed was non-zero.
+      * The file is absent and its directory is not writable. The guard cannot
+        create it, so it will be absent for exactly as long as the permissions
+        last, no matter how many thousands of times the hook fires.
+
+    Only the fourth case -- absent, with a writable directory the guard could
+    have used and did not -- means what "never ran" says. Getting this wrong is
+    not a cosmetic mislabel: it sends an operator to debug settings.json
+    wiring that is already correct, and it tells an auditor that a control
+    which has been blocking all week was never in operation.
+    """
+    directory = os.path.dirname(hb_path) or "."
+    if os.path.exists(hb_path):
+        if isinstance(exc, ValueError):
+            return "cannot-read", (
+                f"{hb_path} exists but does not parse ({exc}) -- the guard has "
+                f"written here, so this is a damaged record, not an absent one")
+        return "cannot-read", (
+            f"{hb_path} exists but could not be read "
+            f"({type(exc).__name__}: {exc})")
+    if not writable(directory):
+        return "cannot-record", (
+            f"{directory} is not writable, so the guard cannot create "
+            f"{os.path.basename(hb_path)} -- this says nothing about whether "
+            f"the hook has been firing")
+    return "never-ran", f"{hb_path} absent, and {directory} is writable"
+
+
 def liveness_facts(target, max_age_hours):
     """Gather, once, everything both --live and --evidence need.
 
@@ -1186,12 +1296,13 @@ def liveness_facts(target, max_age_hours):
     try:
         with open(hb_path) as f:
             hb = json.load(f)
-    except (FileNotFoundError, ValueError, OSError):
-        facts["rows"].append((FAIL, "heartbeat written by the harness",
-                              f"{hb_path} absent or unreadable"))
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        kind, detail = classify_missing_heartbeat(hb_path, exc)
+        label = ("heartbeat written by the harness" if kind == "never-ran"
+                 else "heartbeat can be written at all")
+        facts["rows"].append((FAIL, label, detail))
         facts["ok"] = False
-        facts["stop"] = {"kind": "never-ran", "detail":
-                         f"{hb_path} absent or unreadable"}
+        facts["stop"] = {"kind": kind, "detail": detail}
         return facts
     facts["hb"] = hb
 
@@ -1310,6 +1421,10 @@ def check_live(target, max_age_hours):
     if stop and stop["kind"] == "heartbeat-disabled":
         print("\n  heartbeat_path is disabled in your config, so liveness "
               "cannot be checked. Set it to a path to enable this.")
+        return 1
+
+    if stop and stop["kind"] in ("cannot-record", "cannot-read"):
+        print(CANNOT_RECORD.format(detail=stop["detail"]))
         return 1
 
     if stop and stop["kind"] == "never-ran":
@@ -1624,6 +1739,22 @@ def evidence_report(target, max_age_hours, include_attempts=False):
             "min_tier_for_tier_gated": config.get("min_tier_for_tier_gated"),
         },
         "enforcement": blocks,
+        # Whether the two places this report draws from can be written at all.
+        # An auditor reading "0 blocks" needs to know which of two things they
+        # are looking at: a quiet week, or a log the guard has been unable to
+        # append to. The guard cannot tell them -- it swallows that failure by
+        # design so a write error can never turn a block into an allow -- so
+        # the verifier probes it directly and states it here.
+        "recording": {
+            "heartbeat_path": facts["hb_path"],
+            "heartbeat_writable": (
+                writable(os.path.dirname(facts["hb_path"]) or ".")
+                if facts["hb_path"] else None),
+            "blocked_log_path": blocked_log,
+            "blocked_log_writable": (
+                writable(os.path.dirname(blocked_log) or ".")
+                if blocked_log else None),
+        },
         "checks": [{"status": s, "check": label, "detail": detail}
                    for s, label, detail in facts["rows"]],
         "artifacts": {
@@ -1717,6 +1848,22 @@ def render_evidence_markdown(report):
             f"The sections below are reported as found, and section 2 names "
             f"what did not line up.")
         add("")
+        # `cannot-record` and `never-ran` both land on NOT ESTABLISHED, and
+        # they are not the same finding. One says the control was never in
+        # operation. The other says the control's record-keeping is broken and
+        # its operation is therefore unknown -- which is compatible with it
+        # having blocked every gated call all week. A reader who takes the
+        # first for the second has been misled by this report.
+        if status["reason"] in ("cannot-record", "cannot-read"):
+            add("> **Read that reason precisely: it is a finding about the "
+                "record, not about the control.** The guard writes its "
+                "heartbeat best-effort and swallows any failure, so that a "
+                "bookkeeping error can never turn a block into an allow. The "
+                "cost is that an unwritable evidence path is externally "
+                "indistinguishable from a hook that never fired. This report "
+                "will not guess between them, and it does **not** assert that "
+                "the gate was inactive. See §3 for which path failed.")
+            add("")
 
     add("## 2. Was the control operating?")
     add("")
@@ -1753,6 +1900,24 @@ def render_evidence_markdown(report):
             f"lowest tier, so tier-gated rules were blocking throughout, but "
             f"this report cannot state what tier the project was configured "
             f"at.")
+    rec = b.get("recording") or {}
+    # Printed unconditionally, including when both are fine. A reader who only
+    # ever sees this line when something is wrong cannot tell a healthy report
+    # from an older one that predates the check.
+    for label, path_key, ok_key, consequence in (
+            ("Liveness record", "heartbeat_path", "heartbeat_writable",
+             "the control's operation cannot be evidenced at all"),
+            ("Enforcement log", "blocked_log_path", "blocked_log_writable",
+             "blocks are still enforced but section 4 will under-report them")):
+        path, ok = rec.get(path_key), rec.get(ok_key)
+        if not path:
+            add(f"- **{label}:** disabled in the config — {consequence}.")
+        elif ok:
+            add(f"- **{label}:** `{path}` (writable)")
+        else:
+            add(f"- **{label}:** `{path}` — **NOT WRITABLE at report time**, "
+                f"so {consequence}. Any count below drawn from it is a floor "
+                f"on a broken channel, not a measurement.")
     add("")
     callers = a["callers_seen"]
     if callers:

@@ -158,7 +158,7 @@ Narrow them — the config is a JSON file.
 | `tests/test_budget_guard.py` | 24 cases covering pricing, transcript deduplication, ceilings and loop detection. |
 | `tests/test_verify.py` | 31 cases. Five deliberately break `budget_guard.py` and assert `verify.py` catches it — a verifier that passes a broken guard is worse than none. |
 | `tests/test_demo.py` | 32 cases running `demo.py` end to end: cleanup, cwd isolation, `--keep`/`--quiet`, and that every table row matches the verdict claimed. |
-| `tests/test_heartbeat.py` | 52 cases covering the liveness heartbeat, caller attribution, `verify.py --live` and `--evidence`: that a hook which never fires is distinguishable from one that fires and allows, that an unmarked call is recorded as unattributed rather than assumed to be the main session, that a hostile marker cannot corrupt the file, that bookkeeping never turns a block into an allow even when the heartbeat is unwritable, and that an evidence report never claims an operating control it cannot evidence. |
+| `tests/test_heartbeat.py` | 69 cases covering the liveness heartbeat, caller attribution, `verify.py --live` and `--evidence`: that a hook which never fires is distinguishable from one that fires and allows, that an unmarked call is recorded as unattributed rather than assumed to be the main session, that a hostile marker cannot corrupt the file, that bookkeeping never turns a block into an allow even when the heartbeat is unwritable, that an unwritable evidence path is reported as an unwritable evidence path rather than as a hook that never fired, and that an evidence report never claims an operating control it cannot evidence. |
 
 Nothing here is specific to any one business, product, or agent identity.
 Config is JSON, state is JSON, the queue is JSONL. Drop it into any project.
@@ -349,6 +349,8 @@ WIRING -- approval gate
   PASS  built-in rules preserved                        1 list(s) overridden, 0 built-in entries dropped
   PASS  trust tier readable                             agent-state.json, trust tier 0 (unlocks at 1; tier-gated rules are ON)
   WARN  git push allowlist present                      file exists but lists 0 remotes -- every git push is blocked, same as if it were missing
+  PASS  heartbeat directory writable                    /p/approvals
+  PASS  blocked-log directory writable                  /p/approvals
 
 BEHAVIOR -- approval gate
   PASS  POST to a payment API                           blocked [PAYMENT_API_WRITE]
@@ -457,6 +459,49 @@ green tick. Four details worth knowing:
 The heartbeat holds counters, timestamps and paths — no tool arguments, no
 command text, nothing from your prompts. Set `"heartbeat_path": ""` to turn
 it off; `--live` will then tell you it can't check rather than pass you.
+
+#### "Never ran" and "can't write it down" are different findings
+
+`gate_guard.py` swallows every bookkeeping failure. That is deliberate and it
+does not change: under the `PreToolUse` contract any exit status other than
+`0` or `2` is treated as a non-blocking error and **the tool call runs**, so a
+hook that raised while writing its own heartbeat would turn a block into an
+allow. Losing the record is the lesser failure, every time.
+
+The cost of that trade is an ambiguity, and until v0.8.0 this tool resolved it
+the wrong way. If `approvals/` is read-only — a container mount, a wrong
+umask, a tree owned by another user — the guard blocks every gated call
+correctly and writes nothing at all. From the outside that is byte-identical
+to a hook the harness has never invoked, and `--live` printed the never-ran
+runbook: *restart your session, check your settings.json*. All of it useless,
+because the wiring was already right. `--evidence` was worse: it reported
+`never-ran`, which is a claim about the harness, to describe a file
+permission — and reported it about a control that had been enforcing all week.
+
+So the verifier now probes the paths directly instead of inferring from
+silence:
+
+- **Two wiring rows**, `heartbeat directory writable` and `blocked-log
+  directory writable`. The first is a `FAIL` (without it, operation can never
+  be evidenced); the second is a `WARN` (enforcement is untouched — only the
+  audit trail is lost). The budget half of `verify.py` has had these rows
+  since it shipped; the gate half, whose entire product claim is evidence, did
+  not.
+- **Three stop reasons where there was one.** `never-ran` now means what it
+  says — heartbeat absent from a writable directory. `cannot-record` means the
+  directory cannot be written. `cannot-read` means the file exists but is
+  unreadable or corrupt, which is itself proof that *something* wrote it.
+- **A block that could not be logged says so, in the block message.** The
+  moment a human is definitely reading the guard's output is the moment it is
+  blocking them. It states that the block stands and the record did not, and
+  it no longer prints "This block is logged to …" when nothing was logged.
+- **§3 of `--evidence` names both paths and whether they are writable**,
+  printed whether or not anything is wrong — so a healthy report is
+  distinguishable from one produced before this check existed.
+
+What none of this does is guess. `cannot-record` still reports **NOT
+ESTABLISHED**, because there genuinely is no operating record to hand anyone.
+It just no longer dresses a missing record up as a missing control.
 
 #### Subagent coverage: does the gate bind on delegated work?
 
@@ -982,7 +1027,7 @@ python3 tests/test_install.py       # 27 cases, settings-merge safety
 python3 tests/test_budget_guard.py  # 24 cases, pricing and loop detection
 python3 tests/test_verify.py        # 69 cases, incl. mutation tests on verify.py
 python3 tests/test_demo.py          # 32 cases, front-door demo end to end
-python3 tests/test_heartbeat.py     # 56 cases, liveness, --live and --evidence
+python3 tests/test_heartbeat.py     # 69 cases, liveness, --live and --evidence
 python3 tests/test_over_blocks.py   # 21 cases, over-block analysis
 ```
 

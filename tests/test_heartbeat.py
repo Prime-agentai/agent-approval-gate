@@ -857,5 +857,191 @@ class EvidenceReportTests(unittest.TestCase):
             self.assertNotIn(_FUND_MOVE, md)
 
 
+def read_only(directory):
+    """Make a directory unwritable, the way a wrong umask, a container mount
+    or a checked-out tree owned by another user does in practice."""
+    os.chmod(directory, 0o500)
+
+
+class UnwritableEvidenceTests(unittest.TestCase):
+    """The gate blocks correctly and cannot write down that it did.
+
+    This is the last member of the audit series that produced the push-state,
+    trust-tier and config-state messages, and it sits one layer in from all
+    three: not "the guard reported an absence as a decision" but "the guard
+    could not report at all, and the verifier turned that silence into the
+    strongest negative finding it has".
+
+    gate_guard.py swallows every bookkeeping failure on purpose -- a hook that
+    raised while writing its own heartbeat would exit non-zero, and under the
+    PreToolUse contract that means THE BLOCKED CALL RUNS. That trade is
+    correct and these tests pin it: every assertion below runs against a
+    project whose approvals/ directory cannot be written, and the first thing
+    each one checks is that the block still happened.
+
+    What changes is only what gets said. Three separate sentences were wrong
+    before, and each has a test:
+      * the block message claimed the block was logged when it was not,
+      * `--live` printed the never-ran runbook, sending an operator to debug
+        settings.json wiring that was already correct,
+      * `--evidence` reported reason `never-ran`, which is a claim about the
+        harness, to describe a filesystem permission.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.config_path = project(self._tmp.name)
+        self.approvals = os.path.join(self.tmp, "approvals")
+        os.makedirs(self.approvals)
+
+    def tearDown(self):
+        # Restore before cleanup or TemporaryDirectory cannot remove it.
+        try:
+            os.chmod(self.approvals, 0o700)
+        except OSError:
+            pass
+        self._tmp.cleanup()
+
+    def block(self):
+        """Attempt a gated action. Returns (exit_code, stderr)."""
+        env = dict(os.environ, GATE_GUARD_CONFIG=self.config_path)
+        env.pop("GATE_GUARD_PROBE", None)
+        proc = subprocess.run(
+            [sys.executable, GUARD], input=json.dumps(bash(_FUND_MOVE)),
+            capture_output=True, text=True, cwd=self.tmp, env=env, timeout=60)
+        return proc.returncode, proc.stderr
+
+    def test_the_block_still_happens_when_nothing_can_be_recorded(self):
+        # The one that must never regress. Everything else in this class is
+        # about wording; this is about whether the control works at all.
+        read_only(self.approvals)
+        code, _ = self.block()
+        self.assertEqual(code, 2)
+
+    def test_the_message_does_not_claim_a_log_it_could_not_write(self):
+        read_only(self.approvals)
+        code, err = self.block()
+        self.assertEqual(code, 2)
+        self.assertIn("ENFORCED BUT NOT RECORDED", err)
+        self.assertIn("This block is NOT logged", err)
+        self.assertNotIn("This block is logged to", err)
+        # And it must say the block itself stands, or a reader takes the
+        # warning for a failure of the gate.
+        self.assertIn("the call did not run", err)
+
+    def test_it_names_the_heartbeat_failure_separately(self):
+        read_only(self.approvals)
+        _, err = self.block()
+        self.assertIn("LIVENESS RECORD IS ALSO FAILING", err)
+        self.assertIn("never having run", err)
+
+    def test_a_normal_block_message_is_unchanged(self):
+        # The discipline config_note() established: a warning appended to
+        # every block trains people to skip the whole message.
+        code, err = self.block()
+        self.assertEqual(code, 2)
+        self.assertIn("This block is logged to", err)
+        self.assertNotIn("ENFORCED BUT NOT RECORDED", err)
+        self.assertNotIn("LIVENESS RECORD", err)
+
+    def test_recorders_report_failure_without_raising(self):
+        read_only(self.approvals)
+        sys.path.insert(0, ROOT)
+        import gate_guard
+        config = gate_guard.load_config()
+        config["_project_root"] = self.tmp
+        config["heartbeat_path"] = HEARTBEAT
+        config["blocked_log"] = os.path.join("approvals", "blocked.jsonl")
+        hb_state, hb_detail = gate_guard.record_heartbeat(
+            config, {}, "Bash", "block", "FUND_MOVEMENT")
+        log_state, log_detail = gate_guard.log_block(
+            "FUND_MOVEMENT", "Bash", "x", 0, config)
+        self.assertEqual(hb_state, gate_guard.REC_UNWRITABLE)
+        self.assertEqual(log_state, gate_guard.REC_UNWRITABLE)
+        # The detail has to name the path -- "it failed" is not actionable.
+        self.assertIn("approvals", hb_detail)
+        self.assertIn("approvals", log_detail)
+
+    def test_a_disabled_heartbeat_is_not_reported_as_a_failure(self):
+        sys.path.insert(0, ROOT)
+        import gate_guard
+        state, _ = gate_guard.record_heartbeat(
+            {"heartbeat_path": "", "_project_root": self.tmp},
+            {}, "Bash", "allow", None)
+        self.assertEqual(state, gate_guard.REC_DISABLED)
+        self.assertEqual(
+            gate_guard.recording_note(state, "", gate_guard.REC_OK, ""), "")
+
+    def test_live_does_not_print_the_never_ran_runbook(self):
+        read_only(self.approvals)
+        code, out = live(self.tmp)
+        self.assertEqual(code, 1)
+        self.assertIn("CANNOT BE ESTABLISHED", out)
+        self.assertIn("not writable", out)
+        # Step 1 of the never-ran runbook. Printing it here sends the operator
+        # to restart a session over a chmod.
+        self.assertNotIn("Restart the harness session", out)
+
+    def test_evidence_reason_separates_permissions_from_the_harness(self):
+        read_only(self.approvals)
+        report = verify.evidence_report(os.path.abspath(self.tmp), 24.0)
+        body = report["body"]
+        self.assertFalse(body["status"]["control_active"])
+        self.assertEqual(body["status"]["reason"], "cannot-record")
+        self.assertFalse(body["recording"]["heartbeat_writable"])
+        self.assertFalse(body["recording"]["blocked_log_writable"])
+        md = verify.render_evidence_markdown(report)
+        self.assertIn("NOT ESTABLISHED", md)
+        self.assertIn("finding about the record, not about the control", md)
+        self.assertIn("NOT WRITABLE at report time", md)
+
+    def test_a_corrupt_heartbeat_is_not_reported_as_never_ran(self):
+        # A truncated write is still a write: something invoked the guard.
+        path = os.path.join(self.tmp, HEARTBEAT)
+        with open(path, "w") as f:
+            f.write("{not json")
+        report = verify.evidence_report(os.path.abspath(self.tmp), 24.0)
+        self.assertEqual(report["body"]["status"]["reason"], "cannot-read")
+        code, out = live(self.tmp)
+        self.assertEqual(code, 1)
+        self.assertNotIn("Restart the harness session", out)
+
+    def test_never_ran_still_says_never_ran(self):
+        # The new classification must not swallow the finding it was carved
+        # out of: an absent heartbeat in a writable directory means what it
+        # has always meant, and the runbook still prints.
+        report = verify.evidence_report(os.path.abspath(self.tmp), 24.0)
+        self.assertEqual(report["body"]["status"]["reason"], "never-ran")
+        self.assertTrue(report["body"]["recording"]["heartbeat_writable"])
+        code, out = live(self.tmp)
+        self.assertEqual(code, 1)
+        self.assertIn("Restart the harness session", out)
+
+    def test_wiring_check_fails_before_anyone_has_to_find_this(self):
+        read_only(self.approvals)
+        rows, _, _, _ = verify.check_wiring(os.path.abspath(self.tmp))
+        by_label = {label: (status, detail) for status, label, detail in rows}
+        self.assertEqual(by_label["heartbeat directory writable"][0], verify.FAIL)
+        # WARN, not FAIL: enforcement is untouched, only the audit trail.
+        self.assertEqual(by_label["blocked-log directory writable"][0], verify.WARN)
+
+    def test_wiring_check_passes_on_a_healthy_project(self):
+        rows, _, _, _ = verify.check_wiring(os.path.abspath(self.tmp))
+        by_label = {label: (status, detail) for status, label, detail in rows}
+        self.assertEqual(by_label["heartbeat directory writable"][0], verify.PASS)
+        self.assertEqual(by_label["blocked-log directory writable"][0], verify.PASS)
+
+    def test_healthy_evidence_states_the_paths_are_writable(self):
+        write_heartbeat(self.tmp)
+        report = verify.evidence_report(os.path.abspath(self.tmp), 24.0)
+        self.assertTrue(report["body"]["recording"]["heartbeat_writable"])
+        md = verify.render_evidence_markdown(report)
+        # Stated even when fine, so a healthy report is distinguishable from
+        # one produced before this section existed.
+        self.assertIn("**Liveness record:**", md)
+        self.assertIn("(writable)", md)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

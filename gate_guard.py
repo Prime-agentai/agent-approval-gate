@@ -265,6 +265,22 @@ CONFIG_UNREADABLE = "unreadable"
 CONFIG_NOT_OBJECT = "not_object"
 CONFIG_UNKNOWN_KEYS = "unknown_keys"
 
+# The same distinction one layer further IN, in the evidence rather than the
+# enforcement path. record_heartbeat() and log_block() both end in
+# `except Exception: pass`, and that is correct -- a guard that crashed on
+# bookkeeping would turn a block into an allow, which is the one outcome worse
+# than losing the record. But swallowing the failure silently means a project
+# whose approvals/ directory is read-only gets a gate that BLOCKS PERFECTLY
+# AND RECORDS NOTHING, and verify.py --evidence then reports it as
+# "never ran". That is absence rendered as a decision: the same conflation the
+# three states above exist to prevent, in the layer this tool's actual pitch
+# rests on. So the write still never raises -- it now returns what happened,
+# and a block that could not be recorded says so in the block message.
+REC_OK = "ok"
+REC_DISABLED = "disabled"       # heartbeat_path set to "" on purpose
+REC_UNWRITABLE = "unwritable"   # directory or file could not be written
+REC_FAILED = "failed"           # anything else, named rather than guessed at
+
 # Keys that live in gate-guard.config.json but are read by a SIBLING tool in
 # the same install, not by this guard. Without this list an unknown-key check
 # flags six keys in our own shipped example config as typos. Measured against
@@ -412,6 +428,44 @@ def config_note(config):
         f"its default -- and a default you believed you had overridden is a "
         f"plausible cause of this block. Run verify.py for the full list."
     )
+
+
+def recording_note(hb_state, hb_detail, log_state, log_detail):
+    """The paragraph appended to a block message when the block was enforced
+    but could not be written down. Returns "" when both records landed, which
+    is the normal case -- so a normal block message is byte-for-byte what it
+    was before this existed.
+
+    Worth being precise about what this is warning of, because it is NOT that
+    the block failed. The block happened; you are reading the proof of it. What
+    failed is the evidence trail, and the consequence is downstream and
+    delayed: verify.py --evidence reads an absent heartbeat as "this gate never
+    ran" and an absent block log as "this gate has never blocked anything".
+    Both sentences would be false, and nobody would be in the room to correct
+    them. The moment a human is definitely reading the guard's output is the
+    moment it is blocking them, so that is where this goes."""
+    if hb_state in (REC_OK, REC_DISABLED) and log_state == REC_OK:
+        return ""
+    lines = []
+    if log_state != REC_OK:
+        lines.append(
+            f"THIS BLOCK WAS ENFORCED BUT NOT RECORDED: the block log could "
+            f"not be written ({log_detail}). The block itself stands -- the "
+            f"call did not run. What is lost is the audit trail, and an "
+            f"evidence report built from that log will show this block as "
+            f"never having happened.")
+    if hb_state not in (REC_OK, REC_DISABLED):
+        lines.append(
+            f"THE LIVENESS RECORD IS ALSO FAILING: the heartbeat could not be "
+            f"written ({hb_detail}). Until that path is writable, verify.py "
+            f"--live and --evidence cannot tell this guard apart from one the "
+            f"harness has never called, and will report it as never having "
+            f"run. It has run; it just cannot say so.")
+    lines.append(
+        "Fix the directory permissions, then run verify.py. Nothing about the "
+        "decision above changes either way -- bookkeeping failure never "
+        "turns a block into an allow.")
+    return "\n\n".join(lines)
 
 
 # The states a trust-tier read can be in. Same defect class as the allowlist
@@ -877,10 +931,15 @@ def record_heartbeat(config, payload, tool_name, decision, rule_id):
       * Every failure here is swallowed. A guard that crashes on bookkeeping
         would turn a block into an allow, which is the one outcome worse than
         having no heartbeat at all.
+
+    Returns (state, detail) so the caller can SAY that it failed without the
+    failure changing anything. Swallowed is not the same as unreported: an
+    unwritable heartbeat is indistinguishable from a hook that never fired,
+    and that is precisely the sentence verify.py would otherwise print.
     """
     rel = config.get("heartbeat_path") or ""
     if not rel:
-        return
+        return REC_DISABLED, "heartbeat_path is empty in the config"
     path = os.path.join(config["_project_root"], rel)
     now = datetime.now(timezone.utc).isoformat()
     probe = bool(os.environ.get("GATE_GUARD_PROBE"))
@@ -947,8 +1006,12 @@ def record_heartbeat(config, payload, tool_name, decision, rule_id):
             json.dump(entry, f, indent=2)
             f.write("\n")
         os.replace(tmp, path)
-    except Exception:
-        pass  # Never let bookkeeping failure change a decision.
+        return REC_OK, path
+    except OSError as exc:
+        # Never let bookkeeping failure change a decision -- only report it.
+        return REC_UNWRITABLE, f"{path}: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return REC_FAILED, f"{path}: {type(exc).__name__}: {exc}"
 
 
 def log_block(rule_id, tool_name, text, tier, config, tier_state=TIER_OK):
@@ -963,7 +1026,11 @@ def log_block(rule_id, tool_name, text, tier, config, tier_state=TIER_OK):
     `config_source` is there for the same reason one level up. A block
     produced by a config that failed to parse was produced by the built-in
     defaults, and an audit trail that presents it as enforcement of the
-    project's own written policy is claiming something that did not happen."""
+    project's own written policy is claiming something that did not happen.
+
+    Returns (state, detail), for the same reason record_heartbeat() does: the
+    append still cannot raise, but a block that was enforced and not recorded
+    is a fact the operator needs and the log itself cannot carry."""
     redacted = "[REDACTED -- credential material]" if rule_id == "KEY_MATERIAL" \
         else text[:500]
     entry = {
@@ -980,8 +1047,12 @@ def log_block(rule_id, tool_name, text, tier, config, tier_state=TIER_OK):
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass  # Never let bookkeeping failure turn a block into an allow.
+        return REC_OK, log_path
+    except OSError as exc:
+        # Never let bookkeeping failure turn a block into an allow.
+        return REC_UNWRITABLE, f"{log_path}: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return REC_FAILED, f"{log_path}: {type(exc).__name__}: {exc}"
 
 
 def evaluate(payload, config):
@@ -1038,8 +1109,9 @@ def main():
     try:
         config = load_config()
         hit, tool_name, text, tier, tier_state = evaluate(payload, config)
-        record_heartbeat(config, payload, tool_name, "block" if hit else "allow",
-                         hit[0] if hit else None)
+        hb_state, hb_detail = record_heartbeat(
+            config, payload, tool_name, "block" if hit else "allow",
+            hit[0] if hit else None)
     except SystemExit:
         raise
     except BaseException as exc:
@@ -1064,16 +1136,26 @@ def main():
         sys.exit(0)
 
     rule_id, explanation = hit
-    log_block(rule_id, tool_name, text, tier, config, tier_state)
+    log_state, log_detail = log_block(
+        rule_id, tool_name, text, tier, config, tier_state)
 
-    # Empty whenever the config was found, parsed, and fully recognised --
-    # which is the normal case, so the normal message is unchanged.
+    # Both empty in the normal case -- config found, parsed and fully
+    # recognised; both records written -- so the normal message is unchanged.
     note = config_note(config)
+    rec = recording_note(hb_state, hb_detail, log_state, log_detail)
     print(
         f"BLOCKED BY APPROVAL GATE [{rule_id}]\n\n"
         f"{explanation}\n\n"
-        + (note + "\n\n" if note else "") +
-        f"This block is logged to {config['blocked_log']}. Do not retry it, "
+        + (note + "\n\n" if note else "")
+        + (rec + "\n\n" if rec else "")
+        # Only claim the log when the write actually landed. Telling someone
+        # their block is on file when it is not is a small sentence that makes
+        # every other sentence here worth less.
+        + (f"This block is logged to {config['blocked_log']}. "
+           if log_state == REC_OK else
+           f"This block is NOT logged -- see above; {config['blocked_log']} "
+           f"could not be written. ") +
+        f"Do not retry it, "
         f"do not work around it, and do not attempt to disable this hook. If "
         f"you genuinely need it, file a request with approve.py request so a "
         f"human sees it, then continue with unblocked work.",
