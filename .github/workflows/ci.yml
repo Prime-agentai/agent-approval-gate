@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test suite (no runner, no dependencies, exactly as CONTRIBUTING.md says)
+        run: |
+          set -e
+          for t in tests/test_*.py examples/test_*.py; do
+            echo "::group::$t"
+            python3 "$t"
+            echo "::endgroup::"
+          done
+
+  quickstart:
+    # The README's 60-second demo, literally, from a clean checkout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: demo.py
+        run: |
+          python3 demo.py | tee /tmp/demo.out
+          grep -q "Every probe decided as expected" /tmp/demo.out
