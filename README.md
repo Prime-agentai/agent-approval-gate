@@ -1,5 +1,7 @@
 # agent-approval-gate
 
+[![CI](https://github.com/Prime-agentai/agent-approval-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/Prime-agentai/agent-approval-gate/actions/workflows/ci.yml)
+
 A sandbox contains what an agent does to the host: files deleted, processes
 spawned, machines reached. It does nothing about an agent that spends money,
 opens an account, or moves funds — those calls go out over a permitted
